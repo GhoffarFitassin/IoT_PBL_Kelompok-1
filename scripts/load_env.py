@@ -3,7 +3,6 @@ import os
 
 Import("env")
 
-
 REQUIRED_KEYS = (
     "WIFI_SSID",
     "WIFI_PASSWORD",
@@ -63,11 +62,11 @@ if missing:
     )
 
 env.Append(
-    BUILD_FLAGS=[
-        f'-D ENV_WIFI_SSID=\\"{escape_for_define(resolved["WIFI_SSID"])}\\"',
-        f'-D ENV_WIFI_PASSWORD=\\"{escape_for_define(resolved["WIFI_PASSWORD"])}\\"',
-        f'-D ENV_WS_HOST=\\"{escape_for_define(resolved["WS_HOST"])}\\"',
-        f'-D ENV_DEVICE_UUID=\\"{escape_for_define(resolved["DEVICE_UUID"])}\\"',
+    CPPDEFINES=[
+        ("ENV_WIFI_SSID", f'\\"{escape_for_define(resolved["WIFI_SSID"])}\\"'),
+        ("ENV_WIFI_PASSWORD", f'\\"{escape_for_define(resolved["WIFI_PASSWORD"])}\\"'),
+        ("ENV_WS_HOST", f'\\"{escape_for_define(resolved["WS_HOST"])}\\"'),
+        ("ENV_DEVICE_UUID", f'\\"{escape_for_define(resolved["DEVICE_UUID"])}\\"'),
     ]
 )
 
