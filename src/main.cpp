@@ -32,7 +32,7 @@ static const char *WIFI_PASSWORD = ENV_WIFI_PASSWORD;
 // Server & Device identity
 // ---------------------------------------------------------------------------
 static const char *WS_HOST = ENV_WS_HOST;
-static const uint16_t WS_PORT = 443;
+static const uint16_t WS_PORT = 3010;
 static const char *WS_PATH = "/ws";
 static const char *DEVICE_UUID = ENV_DEVICE_UUID;
 
@@ -73,12 +73,23 @@ DHT dht(DHT_PIN, DHT_TYPE);
 // ---------------------------------------------------------------------------
 // Protocol constants
 // ---------------------------------------------------------------------------
-#define IMAGE_CHUNK_SIZE (4 * 1024)
+#define IMAGE_CHUNK_SIZE ( * 1024)
 #define TEMP_INTERVAL_DEFAULT 60
 #define COUNT_INTERVAL_DEFAULT 60
 #define ACK_TIMEOUT_MS 30000
 #define RECONNECT_DELAY_MS 5000
 #define LIVE_STREAM_MIN_GAP_MS 200
+
+// ---------------------------------------------------------------------------
+// RGB status LEDs
+// ---------------------------------------------------------------------------
+#define TEMP_LED_R_PIN 4
+#define TEMP_LED_G_PIN 12
+#define TEMP_LED_B_PIN 14
+#define CLASS_LED_R_PIN 15
+#define CLASS_LED_G_PIN 1
+#define CLASS_LED_B_PIN 3
+#define RGB_LED_ACTIVE_HIGH 1
 
 // ---------------------------------------------------------------------------
 // Device mode
@@ -128,6 +139,8 @@ String previewRoomId = "";
 bool liveStreamEnabled = false;
 int tempIntervalSec = TEMP_INTERVAL_DEFAULT;
 int countIntervalSec = COUNT_INTERVAL_DEFAULT;
+bool classUsageKnown = false;
+bool classInUse = false;
 
 unsigned long lastTempMs = 0;
 unsigned long lastImageMs = 0;
@@ -153,6 +166,8 @@ static bool pendingSendCapture = false;
 static String pendingAbilityMethod;
 static String pendingAbilityName;
 static String pendingAbilityRequestId;
+static bool pendingAbilityHasClassLightValue = false;
+static bool pendingAbilityClassLightInUse = false;
 
 static bool hasConfigValue(const char *value)
 {
@@ -169,6 +184,218 @@ static String makeUploadId()
   id += '_';
   id += String(millis());
   return id;
+}
+
+// ---------------------------------------------------------------------------
+// RGB LED helpers
+// ---------------------------------------------------------------------------
+static uint8_t ledLevel(bool on)
+{
+  return RGB_LED_ACTIVE_HIGH ? (on ? HIGH : LOW) : (on ? LOW : HIGH);
+}
+
+static void initRgbLed(uint8_t redPin, uint8_t greenPin, uint8_t bluePin)
+{
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+  digitalWrite(redPin, ledLevel(false));
+  digitalWrite(greenPin, ledLevel(false));
+  digitalWrite(bluePin, ledLevel(false));
+}
+
+static void writeRgbLed(uint8_t redPin, uint8_t greenPin, uint8_t bluePin,
+                        bool red, bool green, bool blue)
+{
+  digitalWrite(redPin, ledLevel(red));
+  digitalWrite(greenPin, ledLevel(green));
+  digitalWrite(bluePin, ledLevel(blue));
+}
+
+static void setTemperatureLed(float temperature)
+{
+  if (temperature < 20.0f)
+  {
+    writeRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN, false, false, true);
+    return;
+  }
+  if (temperature <= 25.0f)
+  {
+    writeRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN, true, true, false);
+    return;
+  }
+  writeRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN, true, false, false);
+}
+
+static void setClassUsageLed(bool inUse, bool known = true)
+{
+  classUsageKnown = known;
+  classInUse = inUse;
+
+  if (!known)
+  {
+    writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, false, false, false);
+    return;
+  }
+
+  if (inUse)
+  {
+    writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, false, true, false);
+    return;
+  }
+  writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, true, true, true);
+}
+
+static bool parseClassLightText(const String &rawText, bool &out)
+{
+  String text = rawText;
+  text.trim();
+  text.toLowerCase();
+  if (text == "true" || text == "1" || text == "used" ||
+      text == "in-use" || text == "in_use" || text == "occupied" ||
+      text == "busy" || text == "yes" || text == "on")
+  {
+    out = true;
+    return true;
+  }
+  if (text == "false" || text == "0" || text == "not-used" ||
+      text == "not_used" || text == "not used" || text == "unused" ||
+      text == "available" || text == "idle" || text == "free" ||
+      text == "vacant" || text == "empty" || text == "no" || text == "off")
+  {
+    out = false;
+    return true;
+  }
+
+  return false;
+}
+
+static bool parseClassLightBool(JsonVariantConst value, bool &out)
+{
+  if (value.isNull())
+    return false;
+
+  if (value.is<bool>())
+  {
+    out = value.as<bool>();
+    return true;
+  }
+
+  if (value.is<int>())
+  {
+    int intValue = value.as<int>();
+    if (intValue == 0 || intValue == 1)
+    {
+      out = intValue == 1;
+      return true;
+    }
+  }
+
+  const char *textValue = value.as<const char *>();
+  if (!textValue)
+    return false;
+
+  return parseClassLightText(String(textValue), out);
+}
+
+static bool readClassLightField(JsonObjectConst obj, const char *key, bool &out)
+{
+  return parseClassLightBool(obj[key], out);
+}
+
+static bool readClassLightNested(JsonObjectConst obj, const char *key, bool &out)
+{
+  if (!obj[key].is<JsonObjectConst>())
+    return false;
+
+  JsonObjectConst nested = obj[key].as<JsonObjectConst>();
+  return readClassLightField(nested, "classInUse", out) ||
+         readClassLightField(nested, "classUsed", out) ||
+         readClassLightField(nested, "roomInUse", out) ||
+         readClassLightField(nested, "roomUsed", out) ||
+         readClassLightField(nested, "isClassUsed", out) ||
+         readClassLightField(nested, "isRoomUsed", out) ||
+         readClassLightField(nested, "used", out) ||
+         readClassLightField(nested, "occupied", out) ||
+         readClassLightField(nested, "inUse", out);
+}
+
+static bool extractClassLightValue(JsonObjectConst obj, bool &out)
+{
+  return readClassLightField(obj, "classInUse", out) ||
+         readClassLightField(obj, "classUsed", out) ||
+         readClassLightField(obj, "roomInUse", out) ||
+         readClassLightField(obj, "roomUsed", out) ||
+         readClassLightField(obj, "isClassUsed", out) ||
+         readClassLightField(obj, "isRoomUsed", out) ||
+         readClassLightField(obj, "used", out) ||
+         readClassLightField(obj, "occupied", out) ||
+         readClassLightField(obj, "inUse", out) ||
+         readClassLightField(obj, "data", out) ||
+         readClassLightField(obj, "value", out) ||
+         readClassLightField(obj, "state", out) ||
+         readClassLightNested(obj, "data", out) ||
+         readClassLightNested(obj, "classroom", out) ||
+         readClassLightNested(obj, "classStatus", out) ||
+         readClassLightNested(obj, "roomStatus", out) ||
+         readClassLightNested(obj, "status", out);
+}
+
+static bool parseClassLightAbility(const String &rawAbility, String &normalizedAbility,
+                                   bool &hasValue, bool &out)
+{
+  const String expectedAbility = "class_light";
+  String abilityText = rawAbility;
+  abilityText.trim();
+  hasValue = false;
+  normalizedAbility = abilityText;
+
+  if (abilityText == expectedAbility)
+  {
+    normalizedAbility = expectedAbility;
+    return true;
+  }
+
+  if (!abilityText.startsWith(expectedAbility))
+    return false;
+
+  int prefixLen = expectedAbility.length();
+  char separator = abilityText.charAt(prefixLen);
+  if (separator != ' ' && separator != ':' && separator != '=' &&
+      separator != '/' && separator != ',')
+    return false;
+
+  String valueText = abilityText.substring(prefixLen + 1);
+  valueText.trim();
+  normalizedAbility = expectedAbility;
+  hasValue = parseClassLightText(valueText, out);
+  return true;
+}
+
+static bool isClassLightAbility(const String &ability)
+{
+  String normalizedAbility;
+  bool hasValue = false;
+  bool value = false;
+  return parseClassLightAbility(ability, normalizedAbility, hasValue, value);
+}
+
+static void normalizeAbilityCommand(String &method, String &ability)
+{
+  method.trim();
+  ability.trim();
+
+  if (!ability.isEmpty())
+    return;
+
+  int firstSpace = method.indexOf(' ');
+  if (firstSpace <= 0)
+    return;
+
+  ability = method.substring(firstSpace + 1);
+  method = method.substring(0, firstSpace);
+  method.trim();
+  ability.trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +537,8 @@ static void sendAbilityDeclaration()
   get["temp"] = "Read latest temperature and humidity";
   get["picture"] = "Capture single JPEG frame and return metadata";
   get["picture_bytes"] = "Capture JPEG frame and return base64 bytes";
+  JsonObject set = doc["abilities"]["set"].to<JsonObject>();
+  set["class_light"] = "Set classroom usage RGB LED status";
   sendPayload(doc);
   Serial.println("[INFO] Ability declaration sent.");
 }
@@ -323,6 +552,7 @@ static void sendTemperature()
   float h = readHumidity();
   if (t < 0 || h < 0)
     return; 
+  setTemperatureLed(t);
 
   JsonDocument doc;
   doc["kind"] = "temperature";
@@ -445,7 +675,8 @@ cleanup:
 // ---------------------------------------------------------------------------
 // Protocol -- ability request handler
 // ---------------------------------------------------------------------------
-static void handleAbilityRequest(const String &method, const String &ability, const String &requestId)
+static void handleAbilityRequest(const String &method, const String &ability, const String &requestId,
+                                 bool hasClassLightValue, bool classLightInUseValue)
 {
   JsonDocument resp;
   resp["kind"] = "ability.response";
@@ -468,6 +699,47 @@ static void handleAbilityRequest(const String &method, const String &ability, co
     reject("payload-invalid");
     return;
   }
+
+  String normalizedAbility = ability;
+  bool abilityHasClassLightValue = false;
+  bool abilityClassLightInUse = false;
+  bool classLightAbility = parseClassLightAbility(ability, normalizedAbility,
+                                                  abilityHasClassLightValue,
+                                                  abilityClassLightInUse);
+  resp["ability"] = normalizedAbility;
+
+  if (method == "set")
+  {
+    if (!classLightAbility)
+    {
+      reject("unsupported-ability");
+      return;
+    }
+
+    if (abilityHasClassLightValue)
+    {
+      hasClassLightValue = true;
+      classLightInUseValue = abilityClassLightInUse;
+    }
+
+    if (!hasClassLightValue)
+    {
+      setClassUsageLed(false, false);
+      reject("payload-invalid");
+      return;
+    }
+
+    setClassUsageLed(classLightInUseValue);
+    resp["accepted"] = true;
+    resp["data"]["classInUse"] = classInUse;
+    resp["data"]["known"] = classUsageKnown;
+    sendPayload(resp);
+    Serial.printf("[INFO] Ability set/%s -> %s\n",
+                  normalizedAbility.c_str(),
+                  classInUse ? "used" : "not-used");
+    return;
+  }
+
   if (method != "get")
   {
     reject("unsupported-ability");
@@ -643,7 +915,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
     const char *channel = data["channel"] | "";
     if (strcmp(channel, "device.client") != 0)
-      break;\
+      break;
     JsonObject msg;
     if (data["data"].is<JsonObject>())
     {
@@ -674,7 +946,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       }
     }
 
-    if (!(msg["accepted"] | false))
+    if (!(msg["accepted"] | false) && strcmp(kind, "ability.request") != 0)
       break;
 
     // ---- Normal dispatch ------------------------------------------------
@@ -690,7 +962,15 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     }
     else if (strcmp(kind, "config.update") == 0)
     {
-      previewRoomId = max(-1, (int)(msg["roomId"] | -1));
+      if (msg["roomId"].is<const char *>())
+      {
+        previewRoomId = msg["roomId"].as<const char *>();
+      }
+      else
+      {
+        int roomId = msg["roomId"] | -1;
+        previewRoomId = roomId >= 0 ? String(roomId) : "";
+      }
       liveStreamEnabled = msg["liveStream"] | false;
       deviceMode = parseMode(msg["mode"] | "", deviceMode);
       tempIntervalSec = max(1, (int)(msg["tempFetchInterval"] | tempIntervalSec));
@@ -708,7 +988,12 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     {
       pendingAbilityMethod = msg["method"] | "";
       pendingAbilityName = msg["ability"] | "";
+      if (pendingAbilityMethod.isEmpty())
+        pendingAbilityMethod = msg["command"] | "";
+      normalizeAbilityCommand(pendingAbilityMethod, pendingAbilityName);
       pendingAbilityRequestId = msg["requestId"] | "";
+      pendingAbilityClassLightInUse = false;
+      pendingAbilityHasClassLightValue = extractClassLightValue(msg, pendingAbilityClassLightInUse);
       Serial.printf("[INFO] Ability request queued: %s/%s\n",
                     pendingAbilityMethod.c_str(), pendingAbilityName.c_str());
     }
@@ -760,6 +1045,10 @@ void setup()
   }
 
   dht.begin();
+  initRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN);
+  initRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN);
+  setClassUsageLed(false, false);
+
   connectWifi();
 
   if (!cameraInit())
@@ -770,7 +1059,7 @@ void setup()
   }
 
   // ---- Configure links2004/WebSockets ------------------------------------
-  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
 
   String hdrs = "X-Auth-Method: deviceUuid\r\nX-Device-UUID: ";
@@ -788,7 +1077,7 @@ void loop()
     wsConnected = false;
     connectWifi();
 
-    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+    webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   }
 
   webSocket.loop();
@@ -814,10 +1103,14 @@ void loop()
     String m = pendingAbilityMethod;
     String a = pendingAbilityName;
     String r = pendingAbilityRequestId;
+    bool hasClassLightValue = pendingAbilityHasClassLightValue;
+    bool classLightInUseValue = pendingAbilityClassLightInUse;
     pendingAbilityMethod = "";
     pendingAbilityName = "";
     pendingAbilityRequestId = "";
-    handleAbilityRequest(m, a, r);
+    pendingAbilityHasClassLightValue = false;
+    pendingAbilityClassLightInUse = false;
+    handleAbilityRequest(m, a, r, hasClassLightValue, classLightInUseValue);
   }
   if (!wsConnected || !handshakeDone || deviceMode == MODE_IDLE)
     return;
