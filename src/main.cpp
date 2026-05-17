@@ -4,7 +4,7 @@
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include "esp_camera.h"
-#include "esp_task_wdt.h" 
+#include "esp_task_wdt.h"
 
 #ifndef ENV_WIFI_SSID
 #define ENV_WIFI_SSID ""
@@ -39,8 +39,8 @@ static const char *DEVICE_UUID = ENV_DEVICE_UUID;
 // ---------------------------------------------------------------------------
 // [TODO-2] DHT sensor
 // ---------------------------------------------------------------------------
-#define DHT_PIN 13     
-#define DHT_TYPE DHT22 
+#define DHT_PIN 13
+#define DHT_TYPE DHT22
 DHT dht(DHT_PIN, DHT_TYPE);
 
 // ---------------------------------------------------------------------------
@@ -67,13 +67,13 @@ DHT dht(DHT_PIN, DHT_TYPE);
 // ---------------------------------------------------------------------------
 // [TODO-4] Image / PSRAM settings
 // ---------------------------------------------------------------------------
-#define JPEG_QUALITY 12           
+#define JPEG_QUALITY 12
 #define FRAME_SIZE FRAMESIZE_SVGA
 
 // ---------------------------------------------------------------------------
 // Protocol constants
 // ---------------------------------------------------------------------------
-#define IMAGE_CHUNK_SIZE ( * 1024)
+#define IMAGE_CHUNK_SIZE (8 * 1024)
 #define TEMP_INTERVAL_DEFAULT 60
 #define COUNT_INTERVAL_DEFAULT 60
 #define ACK_TIMEOUT_MS 30000
@@ -129,7 +129,7 @@ static const char *modeStr(DeviceMode m)
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
-WebSocketsClient webSocket; 
+WebSocketsClient webSocket;
 
 volatile bool wsConnected = false;
 volatile bool handshakeDone = false;
@@ -485,7 +485,7 @@ static bool sendPayload(JsonDocument &doc, bool initial = false)
   JsonDocument env;
   env["type"] = initial ? "subscribe" : "push";
   env["channel"] = "device.client";
-  env["payload"] = doc; 
+  env["payload"] = doc;
 
   String out;
   serializeJson(env, out);
@@ -498,8 +498,9 @@ static bool waitAck()
   unsigned long t0 = millis();
   while (!ack.resolved)
   {
-    webSocket.loop();     
+    webSocket.loop();
     esp_task_wdt_reset();
+    yield();
     if (millis() - t0 > ACK_TIMEOUT_MS)
     {
       Serial.printf("[WARN] ACK timeout (kind=%s)\n", ack.expectedKind.c_str());
@@ -551,7 +552,7 @@ static void sendTemperature()
   float t = readTemperature();
   float h = readHumidity();
   if (t < 0 || h < 0)
-    return; 
+    return;
   setTemperatureLed(t);
 
   JsonDocument doc;
@@ -622,21 +623,12 @@ static void sendChunkedImage(bool isRequested = false)
     while (offset < totalBytes)
     {
       size_t chunkLen = min((size_t)IMAGE_CHUNK_SIZE, totalBytes - offset);
-
       webSocket.sendBIN(fb->buf + offset, chunkLen);
 
-      ack.active = true;
-      ack.expectedKind = "image.chunk.bytes";
-      ack.expectedUploadId = uploadId;
-      ack.resolved = false;
-      ack.accepted = false;
-      if (!waitAck())
-      {
-        Serial.println("[WARN] Chunk ACK failed.");
-        goto cleanup;
-      }
-
       offset += chunkLen;
+
+      webSocket.loop();
+      yield();
     }
   }
 
@@ -1067,7 +1059,6 @@ void setup()
   webSocket.setExtraHeaders(hdrs.c_str());
 
   webSocket.setReconnectInterval(RECONNECT_DELAY_MS);
-
 }
 
 void loop()
