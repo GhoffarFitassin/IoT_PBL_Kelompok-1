@@ -78,7 +78,7 @@ DHT dht(DHT_PIN, DHT_TYPE);
 #define COUNT_INTERVAL_DEFAULT 60
 #define ACK_TIMEOUT_MS 30000
 #define RECONNECT_DELAY_MS 5000
-#define LIVE_STREAM_MIN_GAP_MS 200
+#define LIVESTREAM_FPS -1  // max frames per second during live stream; -1 = uncapped
 
 // ---------------------------------------------------------------------------
 // RGB status LEDs
@@ -145,16 +145,113 @@ bool classInUse = false;
 unsigned long lastTempMs = 0;
 unsigned long lastImageMs = 0;
 bool imageInFlight = false;
+String imageInFlightUploadId = "";
+#define ACK_MAP_SIZE 8  // must be power-of-two; keep load < 0.75
 
 struct PendingAck
 {
-  bool active = false;
-  String expectedKind = "";
-  String expectedUploadId = "";
+  bool active   = false;
   bool resolved = false;
   bool accepted = false;
+  String key    = "";  // "kind:uploadId"
 };
-static PendingAck ack;
+static PendingAck ackMap[ACK_MAP_SIZE];
+
+static uint32_t ackHash(const String &k)
+{
+  // FNV-1a 32-bit
+  uint32_t h = 2166136261UL;
+  for (size_t i = 0; i < k.length(); i++)
+    h = (h ^ (uint8_t)k[i]) * 16777619UL;
+  return h;
+}
+
+static String ackMakeKey(const String &kind, const String &uploadId)
+{
+  return kind + ":" + uploadId;
+}
+
+// Returns pointer to a new slot, or nullptr if key is already active (duplicate).
+// Prints a warning and evicts the oldest colliding slot if the map is full.
+static PendingAck *ackAlloc(const String &kind, const String &uploadId = "")
+{
+  String k = ackMakeKey(kind, uploadId);
+  uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
+
+  // Linear probe
+  for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+  {
+    PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
+
+    // Duplicate guard: same key already waiting
+    if (slot.active && !slot.resolved && slot.key == k)
+    {
+      Serial.printf("[WARN] ACK duplicate suppressed (key=%s)\n", k.c_str());
+      return nullptr;
+    }
+
+    // Free or already-resolved slot -- claim it
+    if (!slot.active || slot.resolved)
+    {
+      slot.active   = true;
+      slot.resolved = false;
+      slot.accepted = false;
+      slot.key      = k;
+      return &slot;
+    }
+  }
+
+  // Map full -- evict the home slot and warn
+  Serial.printf("[WARN] ACK map full, evicting slot for key=%s\n", k.c_str());
+  PendingAck &evict = ackMap[idx];
+  evict.active   = true;
+  evict.resolved = false;
+  evict.accepted = false;
+  evict.key      = k;
+  return &evict;
+}
+
+// O(1) avg: hash directly to the home bucket, then probe for the key.
+static void ackDispatch(const char *kind, const char *uploadId, bool accepted)
+{
+  String k = ackMakeKey(kind, uploadId);
+  uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
+
+  for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+  {
+    PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
+    if (!slot.active)
+      break;  // empty slot -- key not present
+    if (!slot.resolved && slot.key == k)
+    {
+      slot.accepted = accepted;
+      slot.resolved = true;
+      return;
+    }
+  }
+}
+
+// O(1) avg: checks only whether an image.start or image.complete ACK for the
+// given uploadId is still active. Unrelated ACKs (e.g. temperature) do not block
+// new livestream frames.
+static bool ackImageActive(const String &uploadId)
+{
+  const char *imageKinds[] = { "image.start", "image.complete" };
+  for (const char *kind : imageKinds)
+  {
+    String k = ackMakeKey(kind, uploadId);
+    uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
+    for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+    {
+      PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
+      if (!slot.active)
+        break;
+      if (!slot.resolved && slot.key == k)
+        return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Deferred action flags
@@ -493,25 +590,28 @@ static bool sendPayload(JsonDocument &doc, bool initial = false)
   return true;
 }
 
-static bool waitAck()
+static bool waitAck(PendingAck *slot)
 {
+  if (!slot)
+    return false;  // duplicate was suppressed; treat as rejected
   unsigned long t0 = millis();
-  while (!ack.resolved)
+  while (!slot->resolved)
   {
     webSocket.loop();
     esp_task_wdt_reset();
     yield();
     if (millis() - t0 > ACK_TIMEOUT_MS)
     {
-      Serial.printf("[WARN] ACK timeout (kind=%s)\n", ack.expectedKind.c_str());
-      ack.active = false;
+      Serial.printf("[WARN] ACK timeout (key=%s)\n", slot->key.c_str());
+      slot->active = false;
       return false;
     }
 
     taskYIELD();
   }
-  ack.active = false;
-  return ack.accepted;
+  bool accepted = slot->accepted;
+  slot->active = false;
+  return accepted;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,10 +688,13 @@ static void sendChunkedImage(bool isRequested = false)
 
   imageInFlight = true;
   String uploadId = makeUploadId();
+  imageInFlightUploadId = uploadId;
   size_t totalBytes = fb->len;
 
   Serial.printf("[INFO] Image upload start: %u bytes  id=%s\n",
                 totalBytes, uploadId.c_str());
+
+  PendingAck *ack = nullptr;
 
   // ---- 1. image.start ----------------------------------------------------
   {
@@ -606,12 +709,8 @@ static void sendChunkedImage(bool isRequested = false)
       goto cleanup;
   }
 
-  ack.active = true;
-  ack.expectedKind = "image.start";
-  ack.expectedUploadId = uploadId;
-  ack.resolved = false;
-  ack.accepted = false;
-  if (!waitAck())
+  ack = ackAlloc("image.start", uploadId);
+  if (!waitAck(ack))
   {
     Serial.println("[WARN] image.start rejected or timed out.");
     goto cleanup;
@@ -624,7 +723,6 @@ static void sendChunkedImage(bool isRequested = false)
     {
       size_t chunkLen = min((size_t)IMAGE_CHUNK_SIZE, totalBytes - offset);
       webSocket.sendBIN(fb->buf + offset, chunkLen);
-
       offset += chunkLen;
 
       webSocket.loop();
@@ -649,19 +747,18 @@ static void sendChunkedImage(bool isRequested = false)
       goto cleanup;
   }
 
-  ack.active = true;
-  ack.expectedKind = "image.complete";
-  ack.expectedUploadId = uploadId;
-  ack.resolved = false;
-  ack.accepted = false;
-  if (waitAck())
-    Serial.printf("[INFO] Image upload complete (%u bytes).\n", totalBytes);
-  else
-    Serial.println("[WARN] image.complete rejected.");
+  {
+    PendingAck *ackComplete = ackAlloc("image.complete", uploadId);
+    if (waitAck(ackComplete))
+      Serial.printf("[INFO] Image upload complete (%u bytes).\n", totalBytes);
+    else
+      Serial.println("[WARN] image.complete rejected.");
+  }
 
 cleanup:
   esp_camera_fb_return(fb);
   imageInFlight = false;
+  imageInFlightUploadId = "";
 }
 
 // ---------------------------------------------------------------------------
@@ -868,10 +965,13 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
   case WStype_DISCONNECTED:
     wsConnected = false;
     handshakeDone = false;
-    if (ack.active)
+    for (int i = 0; i < ACK_MAP_SIZE; i++)
     {
-      ack.accepted = false;
-      ack.resolved = true;
+      if (ackMap[i].active)
+      {
+        ackMap[i].accepted = false;
+        ackMap[i].resolved = true;
+      }
     }
     Serial.println("[INFO] WebSocket disconnected -- library will reconnect.");
     break;
@@ -925,17 +1025,13 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     const char *kind = msg["kind"] | "";
     Serial.printf("[DBG] kind=%s roomId=%s\n", kind, (const char *)(msg["roomId"] | "(null)"));
 
-    // ---- Resolve pending ACK -------------------------------------------
-    if (ack.active)
+    // ---- Resolve pending ACK (image.start / image.complete only) ------
+    if (strcmp(kind, "image.start") == 0 || strcmp(kind, "image.complete") == 0)
     {
-      bool kMatch = (ack.expectedKind == kind);
-      bool iMatch = ack.expectedUploadId.isEmpty() || ack.expectedUploadId == (const char *)(msg["uploadId"] | "");
-      if (kMatch && iMatch)
-      {
-        ack.accepted = msg["accepted"] | false;
-        ack.resolved = true;
-        break;
-      }
+      const char *uploadId = msg["uploadId"] | "";
+      bool accepted = msg["accepted"] | false;
+      ackDispatch(kind, uploadId, accepted);
+      break;  // ACK messages need no further dispatch
     }
 
     if (!(msg["accepted"] | false) && strcmp(kind, "ability.request") != 0)
@@ -1025,7 +1121,7 @@ static void connectWifi()
 // ---------------------------------------------------------------------------
 void setup()
 {
-  Serial.begin(115200);
+  // Serial.begin(115200);
   Serial.println("\n\n[INFO] ESP32 Device Client booting...");
 
   if (!hasConfigValue(WIFI_SSID) || !hasConfigValue(WIFI_PASSWORD) ||
@@ -1118,13 +1214,18 @@ void loop()
   // ---- Periodic / live image ---------------------------------------------
   if (liveStreamEnabled)
   {
-    // Live stream
+    // Live stream -- honour LIVESTREAM_FPS cap (-1 = uncapped)
+#if LIVESTREAM_FPS > 0
     static unsigned long lastLiveMs = 0;
-    if (now - lastLiveMs >= LIVE_STREAM_MIN_GAP_MS)
+    const unsigned long liveIntervalMs = 1000UL / LIVESTREAM_FPS;
+    if (!ackImageActive(imageInFlightUploadId) && (now - lastLiveMs >= liveIntervalMs))
     {
       lastLiveMs = now;
       sendChunkedImage();
     }
+#else
+    if (!ackImageActive(imageInFlightUploadId)) { sendChunkedImage(); }
+#endif
   }
   else if (now - lastImageMs >= (unsigned long)countIntervalSec * 1000UL)
   {
