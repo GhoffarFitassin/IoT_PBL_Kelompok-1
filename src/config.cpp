@@ -10,7 +10,7 @@ const char *WIFI_PASSWORD = ENV_WIFI_PASSWORD;
 // Server & Device Identity
 // ---------------------------------------------------------------------------
 const char *WS_HOST = ENV_WS_HOST;
-const uint16_t WS_PORT = 3010;
+const uint16_t WS_PORT = atoi(ENV_WS_PORT);
 const char *WS_PATH = "/ws";
 const char *DEVICE_UUID = ENV_DEVICE_UUID;
 

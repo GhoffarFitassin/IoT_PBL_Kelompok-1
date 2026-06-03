@@ -18,6 +18,18 @@
 #define ENV_WS_HOST ""
 #endif
 
+#ifndef ENV_WS_PORT
+#define ENV_WS_PORT ""
+#endif
+
+#ifndef ENV_WS_SSL_ENABLED
+#define ENV_WS_SSL_ENABLED ""
+#endif
+
+#ifndef WS_SSL_ENABLED
+#define WS_SSL_ENABLED 0
+#endif
+
 #ifndef ENV_DEVICE_UUID
 #define ENV_DEVICE_UUID ""
 #endif

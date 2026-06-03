@@ -7,6 +7,8 @@ REQUIRED_KEYS = (
     "WIFI_SSID",
     "WIFI_PASSWORD",
     "WS_HOST",
+    "WS_PORT",
+    "WS_SSL_ENABLED",
     "DEVICE_UUID",
 )
 
@@ -61,13 +63,19 @@ if missing:
         "Create .env from .env.example or export variables in your shell."
     )
 
+# Create numeric define for compile-time #if usage
+ws_ssl_numeric = 1 if resolved["WS_SSL_ENABLED"].lower() == "true" else 0
+
 env.Append(
     CPPDEFINES=[
         ("ENV_WIFI_SSID", f'\\"{escape_for_define(resolved["WIFI_SSID"])}\\"'),
         ("ENV_WIFI_PASSWORD", f'\\"{escape_for_define(resolved["WIFI_PASSWORD"])}\\"'),
         ("ENV_WS_HOST", f'\\"{escape_for_define(resolved["WS_HOST"])}\\"'),
+        ("ENV_WS_PORT", f'\\"{escape_for_define(resolved["WS_PORT"])}\\"'),
+        ("ENV_WS_SSL_ENABLED", f'\\"{escape_for_define(resolved["WS_SSL_ENABLED"])}\\"'),
+        ("WS_SSL_ENABLED", ws_ssl_numeric),
         ("ENV_DEVICE_UUID", f'\\"{escape_for_define(resolved["DEVICE_UUID"])}\\"'),
     ]
 )
 
-print("[dotenv] Loaded WIFI_SSID, WIFI_PASSWORD, WS_HOST, DEVICE_UUID")
+print("[dotenv] Loaded WIFI_SSID, WIFI_PASSWORD, WS_HOST, WS_PORT, WS_SSL_ENABLED, DEVICE_UUID")

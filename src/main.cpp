@@ -539,7 +539,11 @@ void setup()
   }
 
   // ---- Configure links2004/WebSockets ------------------------------------
+#if WS_SSL_ENABLED
+  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+#else
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+#endif
   webSocket.onEvent(webSocketEvent);
 
   String hdrs = "X-Auth-Method: deviceUuid\r\nX-Device-UUID: ";
@@ -556,7 +560,11 @@ void loop()
     wsConnected = false;
     connectWifi();
 
+#if WS_SSL_ENABLED
+    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+#else
     webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+#endif
   }
 
   webSocket.loop();
