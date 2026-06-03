@@ -1,13 +1,12 @@
 #include "temperature.h"
-#include <DHT.h>
+#include <DHTesp.h>
 
 // ---------------------------------------------------------------------------
 // DHT Sensor Configuration
 // ---------------------------------------------------------------------------
 #define DHT_PIN 13
-#define DHT_TYPE DHT22
 
-static DHT dht(DHT_PIN, DHT_TYPE);
+static DHTesp dht;
 
 // ---------------------------------------------------------------------------
 // Public Functions
@@ -15,12 +14,12 @@ static DHT dht(DHT_PIN, DHT_TYPE);
 
 void temperatureInit()
 {
-  dht.begin();
+  dht.setup(DHT_PIN, DHTesp::DHT22);
 }
 
 float readTemperature()
 {
-  float v = dht.readTemperature();
+  float v = dht.getTemperature();
   if (isnan(v))
     return -1.f;
   return v;
@@ -28,7 +27,7 @@ float readTemperature()
 
 float readHumidity()
 {
-  float v = dht.readHumidity();
+  float v = dht.getHumidity();
   if (isnan(v))
     return -1.f;
   return v;

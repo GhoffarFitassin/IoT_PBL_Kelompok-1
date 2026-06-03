@@ -76,7 +76,17 @@ bool cameraInit()
 
 camera_fb_t* cameraCaptureFrame()
 {
-  return esp_camera_fb_get();
+  // esp_camera_fb_get() can hang in hardware fault — add 5s timeout
+  unsigned long t0 = millis();
+  while (true)
+  {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb)
+      return fb;
+    if (millis() - t0 >= 1000)
+      return nullptr;
+    yield();
+  }
 }
 
 void cameraReleaseFrame(camera_fb_t* fb)
