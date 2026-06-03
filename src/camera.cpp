@@ -101,12 +101,12 @@ camera_fb_t* cameraCaptureFrame(bool forceFresh)
     while (millis() - t0 < 1000) // 1 second timeout per attempt
     {
       camera_fb_t *fb = esp_camera_fb_get();
+      esp_task_wdt_reset(); 
+      webSocket.loop();
       if (fb)
         return fb;
       
-      esp_task_wdt_reset(); // Feed watchdog during camera capture wait
       delay(50); // Poll every 50ms - don't hammer camera hardware
-      webSocket.loop(); // Keep connection alive during polling
     }
     
     // Attempt failed - brief delay before retry

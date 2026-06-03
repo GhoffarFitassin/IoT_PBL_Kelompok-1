@@ -549,16 +549,9 @@ void setup()
   ledInit();
   temperatureInit();
 
-  // ---- Configure Watchdog Timer (15 second timeout) ----------------------
-  esp_task_wdt_init(7, true); // 15 sec timeout, panic on timeout
+  // ---- Configure Watchdog Timer (x second timeout) ----------------------
+  esp_task_wdt_init(7, true); // x sec timeout, panic on timeout
   esp_task_wdt_add(NULL);     // Add current thread to WDT watch
-
-  if (!hasConfigValue(WIFI_SSID) || !hasConfigValue(WIFI_PASSWORD) ||
-      !hasConfigValue(WS_HOST) || !hasConfigValue(DEVICE_UUID))
-  {
-    // while (true)
-    //   delay(1000);
-  }
 
   connectWifi();
 

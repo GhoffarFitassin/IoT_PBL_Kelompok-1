@@ -54,7 +54,7 @@ extern const char *DEVICE_UUID;
 #define IMAGE_CHUNK_SIZE (4 * 1024)
 #define TEMP_INTERVAL_DEFAULT 60
 #define COUNT_INTERVAL_DEFAULT 60
-#define ACK_TIMEOUT_MS 10000
+#define ACK_TIMEOUT_MS 1000
 
 // WebSocket reconnect (exponential backoff)
 #define RECONNECT_DELAY_MS 5000       // keep for backward compat, not used for auto-reconnect
