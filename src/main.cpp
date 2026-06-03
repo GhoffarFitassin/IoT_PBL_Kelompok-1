@@ -144,6 +144,7 @@ static String pendingAbilityMethod;
 static String pendingAbilityName;
 static String pendingAbilityRequestId;
 static ClassLedState pendingAbilityClassLightState = CLASS_LED_OFF;
+static bool pendingAbilityNoOutput = false;
 
 // ---------------------------------------------------------------------------
 // WebSocket reconnect state (exponential backoff)
@@ -480,6 +481,14 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       normalizeAbilityCommand(pendingAbilityMethod, pendingAbilityName);
       pendingAbilityRequestId = msg["requestId"] | "";
 
+      // Parse --no-output flag
+      pendingAbilityNoOutput = (pendingAbilityName.indexOf("--no-output") >= 0);
+      if (pendingAbilityNoOutput)
+      {
+        pendingAbilityName.replace("--no-output", "");
+        pendingAbilityName.trim();
+      }
+
       // Parse class light state from the message
       const char *valueStr = msg["value"] | "";
       if (valueStr && valueStr[0] != '\0')
@@ -630,8 +639,10 @@ void loop()
     JsonDocument resp;
     if (handleAbilityRequest(m, a, r, state, resp))
     {
-      sendPayload(resp);
+      if (!pendingAbilityNoOutput)
+        sendPayload(resp);
     }
+    pendingAbilityNoOutput = false;
   }
   if (!wsConnected || !handshakeDone || deviceMode == MODE_IDLE)
     return;
