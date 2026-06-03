@@ -242,8 +242,7 @@ static void sendTemperature()
   if (previewRoomId.length())
     doc["roomId"] = previewRoomId;
 
-  // if (sendPayload(doc))
-
+  sendPayload(doc);
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +270,8 @@ static void sendChunkedImage(bool isRequested = false)
 
 
 
-  PendingAck *ack = nullptr;
+  PendingAck *ackStart = ackAlloc("image.start", uploadId);
+  PendingAck *ackComplete = nullptr;
 
   // ---- 1. image.start ----------------------------------------------------
   {
@@ -282,14 +282,14 @@ static void sendChunkedImage(bool isRequested = false)
     doc["mimeType"] = "image/jpeg";
     doc["totalBytes"] = (int)totalBytes;
     doc["chunkSize"] = IMAGE_CHUNK_SIZE;
-    if (!sendPayload(doc))
+    if (!sendPayload(doc)) {
+      if (ackStart) ackStart->active = false;
       goto cleanup;
+    }
   }
 
-  ack = ackAlloc("image.start", uploadId);
-  if (!waitAck(ack))
+  if (!waitAck(ackStart))
   {
-
     goto cleanup;
   }
 
@@ -299,15 +299,21 @@ static void sendChunkedImage(bool isRequested = false)
     while (offset < totalBytes)
     {
       size_t chunkLen = min((size_t)IMAGE_CHUNK_SIZE, totalBytes - offset);
-      webSocket.sendBIN(fb->buf + offset, chunkLen);
-      offset += chunkLen;
+      
+      if (webSocket.sendBIN(fb->buf + offset, chunkLen)) {
+        offset += chunkLen;
+      } else {
+        delay(5);
+      }
 
       webSocket.loop();
+      esp_task_wdt_reset();
       yield();
     }
   }
 
   // ---- 3. image.complete -------------------------------------------------
+  ackComplete = ackAlloc("image.complete", uploadId);
   {
     JsonDocument doc;
     doc["kind"] = "image.complete";
@@ -320,15 +326,14 @@ static void sendChunkedImage(bool isRequested = false)
       doc["liveStream"] = true;
     if (isRequested)
       doc["isRequested"] = true;
-    if (!sendPayload(doc))
+      
+    if (!sendPayload(doc)) {
+      if (ackComplete) ackComplete->active = false;
       goto cleanup;
+    }
   }
 
-  {
-    PendingAck *ackComplete = ackAlloc("image.complete", uploadId);
-    
-    waitAck(ackComplete);
-  }
+  waitAck(ackComplete);
 
 cleanup:
   esp_camera_fb_return(fb);
