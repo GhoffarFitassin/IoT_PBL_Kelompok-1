@@ -101,6 +101,16 @@ enum DeviceMode
   MODE_IDLE
 };
 
+// ---------------------------------------------------------------------------
+// Class LED state
+// ---------------------------------------------------------------------------
+enum ClassLedState
+{
+  CLASS_LED_OFF,
+  CLASS_LED_UNUSED,
+  CLASS_LED_USED
+};
+
 static DeviceMode parseMode(const char *s, DeviceMode def = MODE_NORMAL)
 {
   if (!s)
@@ -139,7 +149,6 @@ String previewRoomId = "";
 bool liveStreamEnabled = false;
 int tempIntervalSec = TEMP_INTERVAL_DEFAULT;
 int countIntervalSec = COUNT_INTERVAL_DEFAULT;
-bool classUsageKnown = false;
 bool classInUse = false;
 
 unsigned long lastTempMs = 0;
@@ -186,7 +195,7 @@ static PendingAck *ackAlloc(const String &kind, const String &uploadId = "")
     // Duplicate guard: same key already waiting
     if (slot.active && !slot.resolved && slot.key == k)
     {
-      Serial.printf("[WARN] ACK duplicate suppressed (key=%s)\n", k.c_str());
+      // Serial.printf("[WARN] ACK duplicate suppressed (key=%s)\n", k.c_str());
       return nullptr;
     }
 
@@ -202,7 +211,7 @@ static PendingAck *ackAlloc(const String &kind, const String &uploadId = "")
   }
 
   // Map full -- evict the home slot and warn
-  Serial.printf("[WARN] ACK map full, evicting slot for key=%s\n", k.c_str());
+  // Serial.printf("[WARN] ACK map full, evicting slot for key=%s\n", k.c_str());
   PendingAck &evict = ackMap[idx];
   evict.active   = true;
   evict.resolved = false;
@@ -263,8 +272,7 @@ static bool pendingSendCapture = false;
 static String pendingAbilityMethod;
 static String pendingAbilityName;
 static String pendingAbilityRequestId;
-static bool pendingAbilityHasClassLightValue = false;
-static bool pendingAbilityClassLightInUse = false;
+static ClassLedState pendingAbilityClassLightState = CLASS_LED_OFF;
 
 static bool hasConfigValue(const char *value)
 {
@@ -324,157 +332,69 @@ static void setTemperatureLed(float temperature)
   writeRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN, true, false, false);
 }
 
-static void setClassUsageLed(bool inUse, bool known = true)
+static void setClassUsageLed(ClassLedState state)
 {
-  classUsageKnown = known;
-  classInUse = inUse;
-
-  if (!known)
+  classInUse = (state == CLASS_LED_USED);
+  
+  switch (state)
   {
-    writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, false, false, false);
-    return;
+    case CLASS_LED_USED:
+      // Green when class is in use
+      writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, false, true, false);
+      break;
+    
+    case CLASS_LED_UNUSED:
+      // Red when class is not in use
+      writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, true, true, true);
+      break;
+    
+    case CLASS_LED_OFF:
+    default:
+      // Off - all LEDs off
+      writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, false, false, false);
+      break;
   }
-
-  if (inUse)
-  {
-    writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, false, true, false);
-    return;
-  }
-  writeRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN, true, true, true);
 }
 
-static bool parseClassLightText(const String &rawText, bool &out)
+// Parse class light value: only accepts "used", "unused", "off"
+static ClassLedState parseClassLightValue(const String &rawText)
 {
   String text = rawText;
   text.trim();
   text.toLowerCase();
-  if (text == "true" || text == "1" || text == "used" ||
-      text == "in-use" || text == "in_use" || text == "occupied" ||
-      text == "busy" || text == "yes" || text == "on")
-  {
-    out = true;
-    return true;
-  }
-  if (text == "false" || text == "0" || text == "not-used" ||
-      text == "not_used" || text == "not used" || text == "unused" ||
-      text == "available" || text == "idle" || text == "free" ||
-      text == "vacant" || text == "empty" || text == "no" || text == "off")
-  {
-    out = false;
-    return true;
-  }
-
-  return false;
+  
+  if (text == "used")
+    return CLASS_LED_USED;
+  if (text == "unused")
+    return CLASS_LED_UNUSED;
+  if (text == "off")
+    return CLASS_LED_OFF;
+  
+  return CLASS_LED_OFF; // default to off for invalid values
 }
 
-static bool parseClassLightBool(JsonVariantConst value, bool &out)
-{
-  if (value.isNull())
-    return false;
-
-  if (value.is<bool>())
-  {
-    out = value.as<bool>();
-    return true;
-  }
-
-  if (value.is<int>())
-  {
-    int intValue = value.as<int>();
-    if (intValue == 0 || intValue == 1)
-    {
-      out = intValue == 1;
-      return true;
-    }
-  }
-
-  const char *textValue = value.as<const char *>();
-  if (!textValue)
-    return false;
-
-  return parseClassLightText(String(textValue), out);
-}
-
-static bool readClassLightField(JsonObjectConst obj, const char *key, bool &out)
-{
-  return parseClassLightBool(obj[key], out);
-}
-
-static bool readClassLightNested(JsonObjectConst obj, const char *key, bool &out)
-{
-  if (!obj[key].is<JsonObjectConst>())
-    return false;
-
-  JsonObjectConst nested = obj[key].as<JsonObjectConst>();
-  return readClassLightField(nested, "classInUse", out) ||
-         readClassLightField(nested, "classUsed", out) ||
-         readClassLightField(nested, "roomInUse", out) ||
-         readClassLightField(nested, "roomUsed", out) ||
-         readClassLightField(nested, "isClassUsed", out) ||
-         readClassLightField(nested, "isRoomUsed", out) ||
-         readClassLightField(nested, "used", out) ||
-         readClassLightField(nested, "occupied", out) ||
-         readClassLightField(nested, "inUse", out);
-}
-
-static bool extractClassLightValue(JsonObjectConst obj, bool &out)
-{
-  return readClassLightField(obj, "classInUse", out) ||
-         readClassLightField(obj, "classUsed", out) ||
-         readClassLightField(obj, "roomInUse", out) ||
-         readClassLightField(obj, "roomUsed", out) ||
-         readClassLightField(obj, "isClassUsed", out) ||
-         readClassLightField(obj, "isRoomUsed", out) ||
-         readClassLightField(obj, "used", out) ||
-         readClassLightField(obj, "occupied", out) ||
-         readClassLightField(obj, "inUse", out) ||
-         readClassLightField(obj, "data", out) ||
-         readClassLightField(obj, "value", out) ||
-         readClassLightField(obj, "state", out) ||
-         readClassLightNested(obj, "data", out) ||
-         readClassLightNested(obj, "classroom", out) ||
-         readClassLightNested(obj, "classStatus", out) ||
-         readClassLightNested(obj, "roomStatus", out) ||
-         readClassLightNested(obj, "status", out);
-}
-
-static bool parseClassLightAbility(const String &rawAbility, String &normalizedAbility,
-                                   bool &hasValue, bool &out)
+static ClassLedState parseClassLightAbility(const String &rawAbility, String &normalizedAbility)
 {
   const String expectedAbility = "class_light";
   String abilityText = rawAbility;
   abilityText.trim();
-  hasValue = false;
-  normalizedAbility = abilityText;
+  normalizedAbility = "class_light";
 
+  // Just "class_light" without value -> default to off
   if (abilityText == expectedAbility)
-  {
-    normalizedAbility = expectedAbility;
-    return true;
-  }
+    return CLASS_LED_OFF;
 
   if (!abilityText.startsWith(expectedAbility))
-    return false;
+    return CLASS_LED_OFF;
 
   int prefixLen = expectedAbility.length();
   char separator = abilityText.charAt(prefixLen);
   if (separator != ' ' && separator != ':' && separator != '=' &&
       separator != '/' && separator != ',')
-    return false;
+    return CLASS_LED_OFF;
 
   String valueText = abilityText.substring(prefixLen + 1);
-  valueText.trim();
-  normalizedAbility = expectedAbility;
-  hasValue = parseClassLightText(valueText, out);
-  return true;
-}
-
-static bool isClassLightAbility(const String &ability)
-{
-  String normalizedAbility;
-  bool hasValue = false;
-  bool value = false;
-  return parseClassLightAbility(ability, normalizedAbility, hasValue, value);
+  return parseClassLightValue(valueText);
 }
 
 static void normalizeAbilityCommand(String &method, String &ability)
@@ -503,7 +423,7 @@ static float readTemperature()
   float v = dht.readTemperature();
   if (isnan(v))
   {
-    Serial.println("[WARN] DHT temp read failed");
+    // Serial.println("[WARN] DHT temp read failed");
     return -1.f;
   }
   return v;
@@ -513,7 +433,7 @@ static float readHumidity()
   float v = dht.readHumidity();
   if (isnan(v))
   {
-    Serial.println("[WARN] DHT humidity read failed");
+    // Serial.println("[WARN] DHT humidity read failed");
     return -1.f;
   }
   return v;
@@ -562,10 +482,10 @@ static bool cameraInit()
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK)
   {
-    Serial.printf("[ERROR] Camera init failed: 0x%x\n", err);
+    // Serial.printf("[ERROR] Camera init failed: 0x%x\n", err);
     return false;
   }
-  Serial.println("[INFO] Camera initialised.");
+  // Serial.println("[INFO] Camera initialised.");
   return true;
 }
 
@@ -602,7 +522,7 @@ static bool waitAck(PendingAck *slot)
     yield();
     if (millis() - t0 > ACK_TIMEOUT_MS)
     {
-      Serial.printf("[WARN] ACK timeout (key=%s)\n", slot->key.c_str());
+      // Serial.printf("[WARN] ACK timeout (key=%s)\n", slot->key.c_str());
       slot->active = false;
       return false;
     }
@@ -623,7 +543,7 @@ static void sendHandshake()
   doc["kind"] = "handshake";
   doc["uuid"] = DEVICE_UUID;
   sendPayload(doc, /*initial=*/true);
-  Serial.println("[INFO] Handshake sent.");
+  // Serial.println("[INFO] Handshake sent.");
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +561,7 @@ static void sendAbilityDeclaration()
   JsonObject set = doc["abilities"]["set"].to<JsonObject>();
   set["class_light"] = "Set classroom usage RGB LED status";
   sendPayload(doc);
-  Serial.println("[INFO] Ability declaration sent.");
+  // Serial.println("[INFO] Ability declaration sent.");
 }
 
 // ---------------------------------------------------------------------------
@@ -664,8 +584,8 @@ static void sendTemperature()
   if (previewRoomId.length())
     doc["roomId"] = previewRoomId;
 
-  if (sendPayload(doc))
-    Serial.printf("[INFO] Temp sent: %.2f C  %.2f %%RH\n", t, h);
+  // if (sendPayload(doc))
+    // Serial.printf("[INFO] Temp sent: %.2f C  %.2f %%RH\n", t, h);
 }
 
 // ---------------------------------------------------------------------------
@@ -675,14 +595,14 @@ static void sendChunkedImage(bool isRequested = false)
 {
   if (imageInFlight && !isRequested)
   {
-    Serial.println("[INFO] Image upload already in flight -- skipping.");
+    // Serial.println("[INFO] Image upload already in flight -- skipping.");
     return;
   }
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb)
   {
-    Serial.println("[WARN] Camera capture failed.");
+    // Serial.println("[WARN] Camera capture failed.");
     return;
   }
 
@@ -691,8 +611,7 @@ static void sendChunkedImage(bool isRequested = false)
   imageInFlightUploadId = uploadId;
   size_t totalBytes = fb->len;
 
-  Serial.printf("[INFO] Image upload start: %u bytes  id=%s\n",
-                totalBytes, uploadId.c_str());
+  // Serial.printf("[INFO] Image upload start: %u bytes  id=%s\n", totalBytes, uploadId.c_str());
 
   PendingAck *ack = nullptr;
 
@@ -712,7 +631,7 @@ static void sendChunkedImage(bool isRequested = false)
   ack = ackAlloc("image.start", uploadId);
   if (!waitAck(ack))
   {
-    Serial.println("[WARN] image.start rejected or timed out.");
+    // Serial.println("[WARN] image.start rejected or timed out.");
     goto cleanup;
   }
 
@@ -749,10 +668,8 @@ static void sendChunkedImage(bool isRequested = false)
 
   {
     PendingAck *ackComplete = ackAlloc("image.complete", uploadId);
-    if (waitAck(ackComplete))
-      Serial.printf("[INFO] Image upload complete (%u bytes).\n", totalBytes);
-    else
-      Serial.println("[WARN] image.complete rejected.");
+    
+    waitAck(ackComplete);
   }
 
 cleanup:
@@ -765,7 +682,7 @@ cleanup:
 // Protocol -- ability request handler
 // ---------------------------------------------------------------------------
 static void handleAbilityRequest(const String &method, const String &ability, const String &requestId,
-                                 bool hasClassLightValue, bool classLightInUseValue)
+                                 ClassLedState classLightState)
 {
   JsonDocument resp;
   resp["kind"] = "ability.response";
@@ -779,8 +696,7 @@ static void handleAbilityRequest(const String &method, const String &ability, co
     resp["accepted"] = false;
     resp["error"] = error;
     sendPayload(resp);
-    Serial.printf("[INFO] Ability rejected %s/%s  error=%s\n",
-                  method.c_str(), ability.c_str(), error);
+    // Serial.printf("[INFO] Ability rejected %s/%s  error=%s\n", method.c_str(), ability.c_str(), error);
   };
 
   if (method.isEmpty() || ability.isEmpty() || requestId.isEmpty())
@@ -789,43 +705,45 @@ static void handleAbilityRequest(const String &method, const String &ability, co
     return;
   }
 
-  String normalizedAbility = ability;
-  bool abilityHasClassLightValue = false;
-  bool abilityClassLightInUse = false;
-  bool classLightAbility = parseClassLightAbility(ability, normalizedAbility,
-                                                  abilityHasClassLightValue,
-                                                  abilityClassLightInUse);
+  String normalizedAbility;
+  ClassLedState abilityState = parseClassLightAbility(ability, normalizedAbility);
+  
+  // Merge ability value with external value (external takes priority if not OFF)
+  if (classLightState != CLASS_LED_OFF)
+    abilityState = classLightState;
+  
   resp["ability"] = normalizedAbility;
 
   if (method == "set")
   {
-    if (!classLightAbility)
+    if (normalizedAbility != "class_light")
     {
       reject("unsupported-ability");
       return;
     }
 
-    if (abilityHasClassLightValue)
-    {
-      hasClassLightValue = true;
-      classLightInUseValue = abilityClassLightInUse;
-    }
-
-    if (!hasClassLightValue)
-    {
-      setClassUsageLed(false, false);
-      reject("payload-invalid");
-      return;
-    }
-
-    setClassUsageLed(classLightInUseValue);
+    setClassUsageLed(abilityState);
     resp["accepted"] = true;
-    resp["data"]["classInUse"] = classInUse;
-    resp["data"]["known"] = classUsageKnown;
+    
+    // Return the LED status as string
+    const char* ledStatus;
+    switch (abilityState)
+    {
+      case CLASS_LED_USED:
+        ledStatus = "used";
+        break;
+      case CLASS_LED_UNUSED:
+        ledStatus = "unused";
+        break;
+      case CLASS_LED_OFF:
+      default:
+        ledStatus = "off";
+        break;
+    }
+    resp["data"]["status"] = ledStatus;
+    
     sendPayload(resp);
-    Serial.printf("[INFO] Ability set/%s -> %s\n",
-                  normalizedAbility.c_str(),
-                  classInUse ? "used" : "not-used");
+    // Serial.printf("[INFO] Ability set/%s -> %s\n", normalizedAbility.c_str(), ledStatus);
     return;
   }
 
@@ -849,7 +767,7 @@ static void handleAbilityRequest(const String &method, const String &ability, co
     resp["data"]["humidity"] = h;
     resp["data"]["mode"] = modeStr(deviceMode);
     sendPayload(resp);
-    Serial.printf("[INFO] Ability get/temp -> %.2f C  %.2f %%RH\n", t, h);
+    // Serial.printf("[INFO] Ability get/temp -> %.2f C  %.2f %%RH\n", t, h);
     return;
   }
 
@@ -871,7 +789,7 @@ static void handleAbilityRequest(const String &method, const String &ability, co
     resp["data"]["bytes"] = byteLen;
     resp["data"]["capturedAt"] = capAt;
     sendPayload(resp);
-    Serial.printf("[INFO] Ability get/picture -> %d bytes metadata sent.\n", byteLen);
+    // Serial.printf("[INFO] Ability get/picture -> %d bytes metadata sent.\n", byteLen);
     return;
   }
 
@@ -937,11 +855,11 @@ static void handleAbilityRequest(const String &method, const String &ability, co
 
     if (!wsConnected)
     {
-      Serial.println("[WARN] picture_bytes: WS disconnected before send.");
+      // Serial.println("[WARN] picture_bytes: WS disconnected before send.");
       return;
     }
     webSocket.sendTXT(txStr);
-    Serial.printf("[INFO] Ability get/picture_bytes -> %u B b64 sent.\n", (unsigned)b64Len);
+    // Serial.printf("[INFO] Ability get/picture_bytes -> %u B b64 sent.\n", (unsigned)b64Len);
     return;
   }
 
@@ -959,7 +877,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     wsConnected = true;
     handshakeDone = false;
     pendingSendHandshake = true;
-    Serial.println("[INFO] WebSocket connected -- handshake deferred to loop().");
+    // Serial.println("[INFO] WebSocket connected -- handshake deferred to loop().");
     break;
 
   case WStype_DISCONNECTED:
@@ -973,19 +891,19 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
         ackMap[i].resolved = true;
       }
     }
-    Serial.println("[INFO] WebSocket disconnected -- library will reconnect.");
+    // Serial.println("[INFO] WebSocket disconnected -- library will reconnect.");
     break;
 
   // ---- text frame --------------------------------------------------------
   case WStype_TEXT:
   {
-    Serial.printf("[RAW] %.*s\n", (int)min(length, (size_t)300), (char *)payload);
+    // Serial.printf("[RAW] %.*s\n", (int)min(length, (size_t)300), (char *)payload);
 
     JsonDocument data;
     DeserializationError derr = deserializeJson(data, payload, length);
     if (derr != DeserializationError::Ok)
     {
-      Serial.printf("[WARN] JSON parse error: %s\n", derr.c_str());
+      // Serial.printf("[WARN] JSON parse error: %s\n", derr.c_str());
       break;
     }
 
@@ -993,13 +911,12 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
     if (strcmp(msgType, "ready") == 0)
     {
-      Serial.println("[INFO] Server ready.");
+      // Serial.println("[INFO] Server ready.");
       break;
     }
     if (strcmp(msgType, "error") == 0)
     {
-      Serial.printf("[ERROR] Server: %s\n",
-                    (const char *)(data["message"] | "unknown"));
+      // Serial.printf("[ERROR] Server: %s\n", (const char *)(data["message"] | "unknown"));
       break;
     }
     if (strcmp(msgType, "data") != 0)
@@ -1019,11 +936,11 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     }
     else
     {
-      Serial.println("[WARN] No data/payload object in message.");
+      // Serial.println("[WARN] No data/payload object in message.");
       break;
     }
     const char *kind = msg["kind"] | "";
-    Serial.printf("[DBG] kind=%s roomId=%s\n", kind, (const char *)(msg["roomId"] | "(null)"));
+    // Serial.printf("[DBG] kind=%s roomId=%s\n", kind, (const char *)(msg["roomId"] | "(null)"));
 
     // ---- Resolve pending ACK (image.start / image.complete only) ------
     if (strcmp(kind, "image.start") == 0 || strcmp(kind, "image.complete") == 0)
@@ -1044,8 +961,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       countIntervalSec = max(1, (int)(msg["countFetchInterval"] | 60));
       deviceMode = parseMode(msg["mode"] | "", MODE_NORMAL);
       handshakeDone = true;
-      Serial.printf("[INFO] Handshake OK | Room: %s | TempInterval: %ds\n",
-                    (const char *)(msg["roomId"] | "none"), tempIntervalSec);
+      // Serial.printf("[INFO] Handshake OK | Room: %s | TempInterval: %ds\n", (const char *)(msg["roomId"] | "none"), tempIntervalSec);
       pendingSendAbilityDecl = true;
     }
     else if (strcmp(kind, "config.update") == 0)
@@ -1063,14 +979,12 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       deviceMode = parseMode(msg["mode"] | "", deviceMode);
       tempIntervalSec = max(1, (int)(msg["tempFetchInterval"] | tempIntervalSec));
       countIntervalSec = max(1, (int)(msg["countFetchInterval"] | countIntervalSec));
-      Serial.printf("[INFO] Config updated | Room: %s | Mode: %s | Live: %s\n",
-                    previewRoomId.c_str(), modeStr(deviceMode),
-                    liveStreamEnabled ? "yes" : "no");
+      // Serial.printf("[INFO] Config updated | Room: %s | Mode: %s | Live: %s\n", previewRoomId.c_str(), modeStr(deviceMode), liveStreamEnabled ? "yes" : "no");
     }
     else if (strcmp(kind, "capture.request") == 0)
     {
       pendingSendCapture = true;
-      Serial.println("[INFO] Capture request received -- deferred to loop().");
+      // Serial.println("[INFO] Capture request received -- deferred to loop().");
     }
     else if (strcmp(kind, "ability.request") == 0)
     {
@@ -1080,14 +994,19 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
         pendingAbilityMethod = msg["command"] | "";
       normalizeAbilityCommand(pendingAbilityMethod, pendingAbilityName);
       pendingAbilityRequestId = msg["requestId"] | "";
-      pendingAbilityClassLightInUse = false;
-      pendingAbilityHasClassLightValue = extractClassLightValue(msg, pendingAbilityClassLightInUse);
-      Serial.printf("[INFO] Ability request queued: %s/%s\n",
-                    pendingAbilityMethod.c_str(), pendingAbilityName.c_str());
+      
+      // Parse class light state from the message
+      const char *valueStr = msg["value"] | "";
+      if (valueStr && valueStr[0] != '\0')
+        pendingAbilityClassLightState = parseClassLightValue(String(valueStr));
+      else
+        pendingAbilityClassLightState = CLASS_LED_OFF;
+      
+      // Serial.printf("[INFO] Ability request queued: %s/%s\n", pendingAbilityMethod.c_str(), pendingAbilityName.c_str());
     }
     else
     {
-      Serial.printf("[DEBUG] Unhandled kind: %s\n", kind);
+      // Serial.printf("[DEBUG] Unhandled kind: %s\n", kind);
     }
     break;
   }
@@ -1105,15 +1024,14 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 // ---------------------------------------------------------------------------
 static void connectWifi()
 {
-  Serial.printf("[INFO] Connecting to WiFi: %s ", WIFI_SSID);
+  // Serial.printf("[INFO] Connecting to WiFi: %s ", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
-    Serial.print('.');
+    // Serial.print('.');
   }
-  Serial.printf("\n[INFO] WiFi connected -- IP: %s\n",
-                WiFi.localIP().toString().c_str());
+  // Serial.printf("\n[INFO] WiFi connected -- IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,27 +1039,26 @@ static void connectWifi()
 // ---------------------------------------------------------------------------
 void setup()
 {
-  // Serial.begin(115200);
-  Serial.println("\n\n[INFO] ESP32 Device Client booting...");
+  Serial.end();
+  initRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN);
+  initRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN);
+
 
   if (!hasConfigValue(WIFI_SSID) || !hasConfigValue(WIFI_PASSWORD) ||
       !hasConfigValue(WS_HOST) || !hasConfigValue(DEVICE_UUID))
   {
-    Serial.println("[ERROR] Missing required build config. Fill .env then rebuild.");
+    // Serial.println("[ERROR] Missing required build config. Fill .env then rebuild.");
     while (true)
       delay(1000);
   }
 
   dht.begin();
-  initRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN);
-  initRgbLed(CLASS_LED_R_PIN, CLASS_LED_G_PIN, CLASS_LED_B_PIN);
-  setClassUsageLed(false, false);
 
   connectWifi();
 
   if (!cameraInit())
   {
-    Serial.println("[ERROR] Camera init failed -- halting.");
+    // Serial.println("[ERROR] Camera init failed -- halting.");
     while (true)
       delay(1000);
   }
@@ -1190,14 +1107,12 @@ void loop()
     String m = pendingAbilityMethod;
     String a = pendingAbilityName;
     String r = pendingAbilityRequestId;
-    bool hasClassLightValue = pendingAbilityHasClassLightValue;
-    bool classLightInUseValue = pendingAbilityClassLightInUse;
+    ClassLedState state = pendingAbilityClassLightState;
     pendingAbilityMethod = "";
     pendingAbilityName = "";
     pendingAbilityRequestId = "";
-    pendingAbilityHasClassLightValue = false;
-    pendingAbilityClassLightInUse = false;
-    handleAbilityRequest(m, a, r, hasClassLightValue, classLightInUseValue);
+    pendingAbilityClassLightState = CLASS_LED_OFF;
+    handleAbilityRequest(m, a, r, state);
   }
   if (!wsConnected || !handshakeDone || deviceMode == MODE_IDLE)
     return;
