@@ -12,8 +12,9 @@
 bool cameraInit();
 
 // Capture a single frame and return frame buffer pointer
+// forceFresh: if true, discards cached buffer to ensure fresh frame
 // Caller must call cameraReleaseFrame() when done
-camera_fb_t* cameraCaptureFrame();
+camera_fb_t* cameraCaptureFrame(bool forceFresh = false);
 
 // Release frame buffer after use
 void cameraReleaseFrame(camera_fb_t* fb);

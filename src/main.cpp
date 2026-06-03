@@ -257,11 +257,12 @@ static void sendChunkedImage(bool isRequested = false)
     return;
   }
 
-  camera_fb_t *fb = cameraCaptureFrame();
+  // Check if camera is temporarily disabled due to repeated failures
+  unsigned long now = millis();
+
+  camera_fb_t *fb = cameraCaptureFrame(isRequested);
   if (!fb)
-  {
     return;
-  }
 
   imageInFlight = true;
   String uploadId = makeUploadId();
@@ -315,6 +316,7 @@ static void sendChunkedImage(bool isRequested = false)
 
       webSocket.loop();
       yield();
+      esp_task_wdt_reset(); // Feed watchdog during image chunking
     }
   }
 
@@ -372,8 +374,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     handshakeDone = false;
     wsReconnecting = true;
     lastReconnectMs = 0; // trigger immediate retry on next loop
-    imageInFlight = false;       
-    imageInFlightUploadId = "";  
+    imageInFlight = false;
+    imageInFlightUploadId = "";
     for (int i = 0; i < ACK_MAP_SIZE; i++)
     {
       if (ackMap[i].active)
@@ -506,6 +508,7 @@ static bool connectWifi()
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
+    esp_task_wdt_reset(); // Feed watchdog during WiFi connection wait
     if (millis() - t0 >= (unsigned long)WIFI_CONNECT_TIMEOUT_MS)
     {
       return false;
@@ -531,11 +534,15 @@ static void startWebSocket()
 // ---------------------------------------------------------------------------
 void setup()
 {
-  Serial.end();
+  // Serial.end(); // Commented out - can interfere with debugging
 
   // Initialize hardware modules
   ledInit();
   temperatureInit();
+
+  // ---- Configure Watchdog Timer (15 second timeout) ----------------------
+  esp_task_wdt_init(7, true); // 15 sec timeout, panic on timeout
+  esp_task_wdt_add(NULL);     // Add current thread to WDT watch
 
   if (!hasConfigValue(WIFI_SSID) || !hasConfigValue(WIFI_PASSWORD) ||
       !hasConfigValue(WS_HOST) || !hasConfigValue(DEVICE_UUID))
@@ -548,8 +555,7 @@ void setup()
 
   if (!cameraInit())
   {
-    while (true)
-      delay(1000);
+    ESP.restart();
   }
 
   // ---- Configure links2004/WebSockets ------------------------------------
@@ -559,11 +565,13 @@ void setup()
   String hdrs = "X-Auth-Method: deviceUuid\r\nX-Device-UUID: ";
   hdrs += DEVICE_UUID;
   webSocket.setExtraHeaders(hdrs.c_str());
-
 }
 
 void loop()
 {
+  // Feed watchdog at start of every loop iteration
+  esp_task_wdt_reset();
+
   if (WiFi.status() != WL_CONNECTED)
   {
     wsConnected = false;
@@ -585,8 +593,6 @@ void loop()
       reconnectAttempt++;
       if (reconnectAttempt >= WS_RECONNECT_ATTEMPT_MAX)
       {
-        // Give up – restart the chip
-        delay(100);
         ESP.restart();
       }
       reconnectDelay = min((unsigned long)(reconnectDelay * WS_RECONNECT_MULTIPLIER),

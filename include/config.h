@@ -51,7 +51,7 @@ extern const char *DEVICE_UUID;
 // ---------------------------------------------------------------------------
 // Protocol Constants
 // ---------------------------------------------------------------------------
-#define IMAGE_CHUNK_SIZE (8 * 1024)
+#define IMAGE_CHUNK_SIZE (4 * 1024)
 #define TEMP_INTERVAL_DEFAULT 60
 #define COUNT_INTERVAL_DEFAULT 60
 #define ACK_TIMEOUT_MS 10000
@@ -61,7 +61,7 @@ extern const char *DEVICE_UUID;
 #define WS_RECONNECT_BASE_MS  1000    // initial backoff (1 s)
 #define WS_RECONNECT_MAX_MS   60000   // cap (60 s)
 #define WS_RECONNECT_MULTIPLIER 2     // exponential factor
-#define WS_RECONNECT_ATTEMPT_MAX 10   // halt after this many consecutive failures
+#define WS_RECONNECT_ATTEMPT_MAX 3   // halt after this many consecutive failures
 #define WS_RECONNECT_RESET_MS  300000 // reset counter after 5 min of stable connection
 
 // WiFi connection timeout

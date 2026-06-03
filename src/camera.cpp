@@ -1,4 +1,9 @@
 #include "camera.h"
+#include "esp_task_wdt.h"
+#include <WebSocketsClient.h>
+
+// Access to WebSocket from main.cpp to keep connection alive during camera ops
+extern WebSocketsClient webSocket;
 
 // ---------------------------------------------------------------------------
 // Camera Pin Configuration -- AI-Thinker ESP32-CAM
@@ -74,19 +79,47 @@ bool cameraInit()
   return true;
 }
 
-camera_fb_t* cameraCaptureFrame()
+camera_fb_t* cameraCaptureFrame(bool forceFresh)
 {
-  // esp_camera_fb_get() can hang in hardware fault — add 5s timeout
-  unsigned long t0 = millis();
-  while (true)
+  // If fresh frame is needed (e.g., server request), flush cached buffer first
+  if (forceFresh)
   {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb)
-      return fb;
-    if (millis() - t0 >= 1000)
-      return nullptr;
-    yield();
+    camera_fb_t *discard = esp_camera_fb_get();
+    if (discard)
+    {
+      esp_camera_fb_return(discard);
+      delay(5); // Brief delay to allow new frame capture
+      webSocket.loop(); // Keep connection alive during delay
+    }
   }
+  
+  // Try up to 3 times with 1s timeout each (max 3s total)
+  // Faster failure detection keeps device responsive to server
+  for (int attempt = 0; attempt < 3; attempt++)
+  {
+    unsigned long t0 = millis();
+    while (millis() - t0 < 1000) // 1 second timeout per attempt
+    {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb)
+        return fb;
+      
+      esp_task_wdt_reset(); // Feed watchdog during camera capture wait
+      delay(50); // Poll every 50ms - don't hammer camera hardware
+      webSocket.loop(); // Keep connection alive during polling
+    }
+    
+    // Attempt failed - brief delay before retry
+    if (attempt < 2)
+    {
+      esp_task_wdt_reset();
+      delay(100); // 100ms between retry attempts
+      webSocket.loop(); // Keep connection alive between retries
+    }
+  }
+  
+  // All 3 attempts failed
+  return nullptr;
 }
 
 void cameraReleaseFrame(camera_fb_t* fb)
