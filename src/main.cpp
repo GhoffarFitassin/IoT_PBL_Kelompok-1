@@ -304,16 +304,8 @@ static void sendChunkedImage(bool isRequested = false)
         offset += chunkLen;
         sendFailCount = 0;
       }
-      else
-      {
-        sendFailCount++;
-        if (sendFailCount >= 3)
-          break; // give up after 3 consecutive failures
-      }
-
+      esp_task_wdt_reset(); 
       webSocket.loop();
-      yield();
-      esp_task_wdt_reset(); // Feed watchdog during image chunking
     }
   }
 
@@ -513,7 +505,7 @@ static void startWebSocket()
 #else
   webSocket.begin(WS_HOST, atoi(ENV_WS_PORT), WS_PATH);
 #endif
-  webSocket.enableHeartbeat(15000, 3000, 2);
+  webSocket.enableHeartbeat(15000, 5000, 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,4 +627,5 @@ void loop()
   }
 
   esp_task_wdt_reset();
+  vTaskDelay(pdMS_TO_TICKS(1));
 }

@@ -24,7 +24,7 @@
 // ---------------------------------------------------------------------------
 // Image / PSRAM Settings
 // ---------------------------------------------------------------------------
-#define JPEG_QUALITY 12
+#define JPEG_QUALITY 2
 #define FRAME_SIZE FRAMESIZE_SVGA
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ static camera_fb_t *captureWithTimeout(bool forceFresh, unsigned long timeoutMs)
   s_captureData.forceFresh = forceFresh;
 
   TaskHandle_t taskHandle = NULL;
-  BaseType_t created = xTaskCreatePinnedToCore(
+  xTaskCreatePinnedToCore(
       captureTaskFunc,
       "cam_cap",
       CAPTURE_TASK_STACK,
@@ -96,21 +96,6 @@ static camera_fb_t *captureWithTimeout(bool forceFresh, unsigned long timeoutMs)
       &taskHandle,
       0 // core 0 — isolated from WebSocket and Arduino loop
   );
-
-  if (created != pdPASS)
-  {
-    // OOM fallback: synchronous capture on calling core
-    unsigned long t0 = millis();
-    while (millis() - t0 < timeoutMs)
-    {
-      camera_fb_t *fb = esp_camera_fb_get();
-      esp_task_wdt_reset();
-      if (fb)
-        return fb;
-      vTaskDelay(pdMS_TO_TICKS(25));
-    }
-    return nullptr;
-  }
 
   // Wait for task completion or timeout
   unsigned long t0 = millis();
@@ -124,7 +109,7 @@ static camera_fb_t *captureWithTimeout(bool forceFresh, unsigned long timeoutMs)
     }
     esp_task_wdt_reset();
     taskYIELD();
-    vTaskDelay(pdMS_TO_TICKS(25));
+    yield();
   }
 
   return s_captureData.fb;
@@ -161,7 +146,7 @@ bool cameraInit()
   {
     cfg.frame_size = FRAME_SIZE;
     cfg.jpeg_quality = JPEG_QUALITY;
-    cfg.fb_count = 1;
+    cfg.fb_count = 2;
     cfg.fb_location = CAMERA_FB_IN_PSRAM;
   }
   else

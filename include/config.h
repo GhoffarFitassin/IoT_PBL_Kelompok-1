@@ -51,7 +51,7 @@ extern const char *DEVICE_UUID;
 // ---------------------------------------------------------------------------
 // Protocol Constants
 // ---------------------------------------------------------------------------
-#define IMAGE_CHUNK_SIZE (4 * 1024)
+#define IMAGE_CHUNK_SIZE (8 * 1024)
 #define TEMP_INTERVAL_DEFAULT 60
 #define COUNT_INTERVAL_DEFAULT 60
 #define ACK_TIMEOUT_MS 1000

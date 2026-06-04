@@ -106,7 +106,7 @@ bool readTemperatureAndHumidity(float &temp, float &hum)
     "dht_read",         // debug name
     TEMP_TASK_STACK,    // stack in bytes
     &data,              // parameter
-    2,                  // priority — low enough not to starve idle/wifi tasks
+    4,                  // priority — low enough not to starve idle/wifi tasks
     &taskHandle,
     0                   // core 0 (pro_cpu / protocol core)
   );
@@ -126,7 +126,7 @@ bool readTemperatureAndHumidity(float &temp, float &hum)
     }
     esp_task_wdt_reset();
     taskYIELD();
-    vTaskDelay(pdMS_TO_TICKS(25));
+    yield();
   }
 
   if (!data.ok)
