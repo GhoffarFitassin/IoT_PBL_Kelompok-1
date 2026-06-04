@@ -147,14 +147,6 @@ static ClassLedState pendingAbilityClassLightState = CLASS_LED_OFF;
 static bool pendingAbilityNoOutput = false;
 
 // ---------------------------------------------------------------------------
-// WebSocket reconnect state (exponential backoff)
-// ---------------------------------------------------------------------------
-static unsigned long lastReconnectMs = 0;
-static int reconnectAttempt = 0;
-static int reconnectDelay = WS_RECONNECT_BASE_MS;
-static bool wsReconnecting = false;
-
-// ---------------------------------------------------------------------------
 // Send helpers
 // ---------------------------------------------------------------------------
 
@@ -230,10 +222,14 @@ static void sendAbilityDeclaration()
 // ---------------------------------------------------------------------------
 static void sendTemperature()
 {
-  float t = readTemperature();
-  float h = readHumidity();
-  if (t < 0 || h < 0)
+  float t, h;
+
+  // Combined read: ONE sensor cycle, WDT safety, failure backoff built in
+  esp_task_wdt_reset();
+  if (!readTemperatureAndHumidity(t, h))
     return;
+  esp_task_wdt_reset();
+
   setTemperatureLed(t);
 
   JsonDocument doc;
@@ -363,29 +359,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     wsConnected = true;
     handshakeDone = false;
     pendingSendHandshake = true;
-    // Reset exponential backoff on successful connection
-    wsReconnecting = false;
-    reconnectAttempt = 0;
-    reconnectDelay = WS_RECONNECT_BASE_MS;
-
     break;
 
   case WStype_DISCONNECTED:
-    wsConnected = false;
-    handshakeDone = false;
-    wsReconnecting = true;
-    lastReconnectMs = 0; // trigger immediate retry on next loop
-    imageInFlight = false;
-    imageInFlightUploadId = "";
-    for (int i = 0; i < ACK_MAP_SIZE; i++)
-    {
-      if (ackMap[i].active)
-      {
-        ackMap[i].accepted = false;
-        ackMap[i].resolved = true;
-      }
-    }
-
+    ESP.restart();
     break;
 
   // ---- text frame --------------------------------------------------------
@@ -536,6 +513,7 @@ static void startWebSocket()
 #else
   webSocket.begin(WS_HOST, atoi(ENV_WS_PORT), WS_PATH);
 #endif
+  webSocket.enableHeartbeat(15000, 3000, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +545,8 @@ void setup()
   String hdrs = "X-Auth-Method: deviceUuid\r\nX-Device-UUID: ";
   hdrs += DEVICE_UUID;
   webSocket.setExtraHeaders(hdrs.c_str());
+
+  esp_task_wdt_reset();
 }
 
 void loop()
@@ -577,30 +557,10 @@ void loop()
   if (WiFi.status() != WL_CONNECTED)
   {
     wsConnected = false;
-    wsReconnecting = true;
     connectWifi();
   }
 
   webSocket.loop();
-
-  // ---- WebSocket reconnect (exponential backoff) --------------------------
-  if (wsReconnecting && WiFi.status() == WL_CONNECTED)
-  {
-    unsigned long now = millis();
-    if (now - lastReconnectMs >= (unsigned long)reconnectDelay)
-    {
-      lastReconnectMs = now;
-      webSocket.disconnect(); // close stale socket before reconnecting
-      startWebSocket();
-      reconnectAttempt++;
-      if (reconnectAttempt >= WS_RECONNECT_ATTEMPT_MAX)
-      {
-        ESP.restart();
-      }
-      reconnectDelay = min((unsigned long)(reconnectDelay * WS_RECONNECT_MULTIPLIER),
-                           (unsigned long)WS_RECONNECT_MAX_MS);
-    }
-  }
 
   // ---- Process deferred actions ----------------------------------------
   if (pendingSendHandshake)
@@ -673,4 +633,6 @@ void loop()
     lastImageMs = now;
     sendChunkedImage();
   }
+
+  esp_task_wdt_reset();
 }

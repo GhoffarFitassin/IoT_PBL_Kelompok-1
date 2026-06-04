@@ -10,10 +10,15 @@
 // Initialize the temperature sensor
 void temperatureInit();
 
-// Read current temperature in Celsius (returns -1 on error)
+// (Legacy) Read current temperature in Celsius (returns -1 on error)
 float readTemperature();
 
-// Read current humidity in percentage (returns -1 on error)
+// (Legacy) Read current humidity in percentage (returns -1 on error)
 float readHumidity();
+
+// Combined read: performs ONE DHT sensor read, fills temp & hum.
+// Returns true on success, false on sensor failure.
+// Does NOT block indefinitely — timeout + WDT reset built in.
+bool readTemperatureAndHumidity(float &temp, float &hum);
 
 #endif // TEMPERATURE_H

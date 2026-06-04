@@ -1,13 +1,8 @@
 #include "camera.h"
 #include "esp_task_wdt.h"
-#include <WebSocketsClient.h>
-
-// Access to WebSocket from main.cpp to keep connection alive during camera ops
-extern WebSocketsClient webSocket;
 
 // ---------------------------------------------------------------------------
 // Camera Pin Configuration -- AI-Thinker ESP32-CAM
-// Replace the entire block below for a different board.
 // ---------------------------------------------------------------------------
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
@@ -33,9 +28,111 @@ extern WebSocketsClient webSocket;
 #define FRAME_SIZE FRAMESIZE_SVGA
 
 // ---------------------------------------------------------------------------
-// Public Functions
+// Timeout & Failure Constants
 // ---------------------------------------------------------------------------
+#define CAPTURE_TASK_TIMEOUT_MS 1000
+#define CAPTURE_TASK_STACK (3 * 1024)
 
+// ---------------------------------------------------------------------------
+// CaptureTaskData — STATIC allocation so the capture task can never write
+// to a freed stack frame if the caller times out and returns early.
+// Only one capture runs at a time so a single static instance is safe.
+// ---------------------------------------------------------------------------
+typedef struct
+{
+  camera_fb_t *fb;
+  volatile bool done;
+  bool forceFresh;
+} CaptureTaskData;
+
+static CaptureTaskData s_captureData;
+
+// ---------------------------------------------------------------------------
+// FreeRTOS capture task — pinned to core 0, isolated from ws_task & loop()
+// ---------------------------------------------------------------------------
+static void captureTaskFunc(void *pvParams)
+{
+  CaptureTaskData *d = (CaptureTaskData *)pvParams;
+
+  if (d->forceFresh)
+  {
+    camera_fb_t *discard = esp_camera_fb_get();
+    if (discard)
+    {
+      esp_camera_fb_return(discard);
+      vTaskDelay(pdMS_TO_TICKS(25));
+    }
+  }
+
+  d->fb = esp_camera_fb_get();
+  d->done = true; // visible to caller: write after fb so compiler can't reorder
+  vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// captureWithTimeout
+//
+// Spawns captureTaskFunc on core 0 and waits up to timeoutMs.
+// Uses the static s_captureData to avoid dangling-pointer UB when the caller
+// times out before the task writes its result.
+// If the task times out it is killed — the camera DMA will eventually finish
+// and write to s_captureData.fb, but done=true is never set so the next call
+// to captureWithTimeout reinitialises s_captureData before spawning again,
+// meaning the stale write is harmless.
+// ---------------------------------------------------------------------------
+static camera_fb_t *captureWithTimeout(bool forceFresh, unsigned long timeoutMs)
+{
+  s_captureData.fb = nullptr;
+  s_captureData.done = false;
+  s_captureData.forceFresh = forceFresh;
+
+  TaskHandle_t taskHandle = NULL;
+  BaseType_t created = xTaskCreatePinnedToCore(
+      captureTaskFunc,
+      "cam_cap",
+      CAPTURE_TASK_STACK,
+      &s_captureData,
+      3, // moderate priority; below ws_task (5), above loop() (1)
+      &taskHandle,
+      0 // core 0 — isolated from WebSocket and Arduino loop
+  );
+
+  if (created != pdPASS)
+  {
+    // OOM fallback: synchronous capture on calling core
+    unsigned long t0 = millis();
+    while (millis() - t0 < timeoutMs)
+    {
+      camera_fb_t *fb = esp_camera_fb_get();
+      esp_task_wdt_reset();
+      if (fb)
+        return fb;
+      vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    return nullptr;
+  }
+
+  // Wait for task completion or timeout
+  unsigned long t0 = millis();
+  while (!s_captureData.done)
+  {
+    if (millis() - t0 >= timeoutMs)
+    {
+      vTaskDelete(taskHandle);
+      // s_captureData is static — safe to leave; will be reset on next call
+      return nullptr;
+    }
+    esp_task_wdt_reset();
+    taskYIELD();
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
+
+  return s_captureData.fb;
+}
+
+// ---------------------------------------------------------------------------
+// cameraInit
+// ---------------------------------------------------------------------------
 bool cameraInit()
 {
   camera_config_t cfg = {};
@@ -64,95 +161,63 @@ bool cameraInit()
   {
     cfg.frame_size = FRAME_SIZE;
     cfg.jpeg_quality = JPEG_QUALITY;
-    cfg.fb_count = 2;
+    cfg.fb_count = 1;
+    cfg.fb_location = CAMERA_FB_IN_PSRAM;
   }
   else
   {
     cfg.frame_size = FRAMESIZE_QVGA;
     cfg.jpeg_quality = 12;
     cfg.fb_count = 1;
+    cfg.fb_location = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK)
     return false;
+
   return true;
 }
 
-camera_fb_t* cameraCaptureFrame(bool forceFresh)
+camera_fb_t *cameraCaptureFrame(bool forceFresh)
 {
-  // If fresh frame is needed (e.g., server request), flush cached buffer first
-  if (forceFresh)
-  {
-    camera_fb_t *discard = esp_camera_fb_get();
-    if (discard)
-    {
-      esp_camera_fb_return(discard);
-      delay(5); // Brief delay to allow new frame capture
-      webSocket.loop(); // Keep connection alive during delay
-    }
-  }
-  
-  // Try up to 3 times with 1s timeout each (max 3s total)
-  // Faster failure detection keeps device responsive to server
-  for (int attempt = 0; attempt < 3; attempt++)
-  {
-    unsigned long t0 = millis();
-    while (millis() - t0 < 1000) // 1 second timeout per attempt
-    {
-      camera_fb_t *fb = esp_camera_fb_get();
-      esp_task_wdt_reset(); 
-      webSocket.loop();
-      if (fb)
-        return fb;
-      
-      delay(50); // Poll every 50ms - don't hammer camera hardware
-    }
-    
-    // Attempt failed - brief delay before retry
-    if (attempt < 2)
-    {
-      esp_task_wdt_reset();
-      delay(100); // 100ms between retry attempts
-      webSocket.loop(); // Keep connection alive between retries
-    }
-  }
-  
-  // All 3 attempts failed
-  return nullptr;
+
+  camera_fb_t *fb = captureWithTimeout(forceFresh, CAPTURE_TASK_TIMEOUT_MS);
+  return fb;
 }
 
-void cameraReleaseFrame(camera_fb_t* fb)
+// ---------------------------------------------------------------------------
+// cameraReleaseFrame
+// ---------------------------------------------------------------------------
+void cameraReleaseFrame(camera_fb_t *fb)
 {
   if (fb)
-  {
     esp_camera_fb_return(fb);
-  }
 }
 
-char* cameraEncodeBase64(camera_fb_t* fb, size_t* outLen)
+// ---------------------------------------------------------------------------
+// cameraEncodeBase64
+// ---------------------------------------------------------------------------
+char *cameraEncodeBase64(camera_fb_t *fb, size_t *outLen)
 {
   if (!fb)
     return nullptr;
 
-  // Base64 encoding characters
   static const char b64chars[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  
+
   size_t inLen = fb->len;
   size_t b64Len = ((inLen + 2) / 3) * 4 + 1;
   char *b64Buf = (char *)malloc(b64Len);
-  
   if (!b64Buf)
     return nullptr;
 
   uint8_t *in = fb->buf;
   char *out = b64Buf;
-  
   for (size_t i = 0; i < inLen; i += 3)
   {
-    uint32_t n = ((uint32_t)in[i] << 16) | 
-                 (i + 1 < inLen ? (uint32_t)in[i + 1] << 8 : 0) | 
+    uint32_t n = ((uint32_t)in[i] << 16) |
+                 (i + 1 < inLen ? (uint32_t)in[i + 1] << 8 : 0) |
                  (i + 2 < inLen ? (uint32_t)in[i + 2] : 0);
     *out++ = b64chars[(n >> 18) & 63];
     *out++ = b64chars[(n >> 12) & 63];
@@ -160,9 +225,7 @@ char* cameraEncodeBase64(camera_fb_t* fb, size_t* outLen)
     *out++ = (i + 2 < inLen) ? b64chars[n & 63] : '=';
   }
   *out = '\0';
-
   if (outLen)
     *outLen = b64Len;
-
   return b64Buf;
 }
