@@ -29,46 +29,55 @@ unsigned long lastTempMs = 0;
 unsigned long lastImageMs = 0;
 bool imageInFlight = false;
 String imageInFlightUploadId = "";
-#define ACK_MAP_SIZE 8 // must be power-of-two; keep load < 0.75
+
+// ---------------------------------------------------------------------------
+// Acknowledgment (ACK) Management - Optimized Linear Map
+// ---------------------------------------------------------------------------
+#define ACK_MAP_SIZE 8
+
+enum AckKind
+{
+  ACK_NONE,
+  ACK_IMAGE_START,
+  ACK_IMAGE_COMPLETE
+};
 
 struct PendingAck
 {
   bool active = false;
   bool resolved = false;
   bool accepted = false;
-  String key = ""; // "kind:uploadId"
+  AckKind kind = ACK_NONE;
+  String uploadId = "";
 };
+
 static PendingAck ackMap[ACK_MAP_SIZE];
 
-static uint32_t ackHash(const String &k)
+// Helper to avoid heavy string comparisons where possible
+static AckKind getAckKind(const char *kindStr)
 {
-  // FNV-1a 32-bit
-  uint32_t h = 2166136261UL;
-  for (size_t i = 0; i < k.length(); i++)
-    h = (h ^ (uint8_t)k[i]) * 16777619UL;
-  return h;
+  if (strcmp(kindStr, "image.start") == 0)
+    return ACK_IMAGE_START;
+  if (strcmp(kindStr, "image.complete") == 0)
+    return ACK_IMAGE_COMPLETE;
+  return ACK_NONE;
 }
 
-static String ackMakeKey(const String &kind, const String &uploadId)
+// O(N) linear scan (N=8). Faster and avoids heap fragmentation from String concat.
+static PendingAck *ackAlloc(AckKind kind, const String &uploadId = "")
 {
-  return kind + ":" + uploadId;
-}
+  if (kind == ACK_NONE)
+    return nullptr;
 
-// Returns pointer to a new slot, or nullptr if key is already active (duplicate).
-// Prints a warning and evicts the oldest colliding slot if the map is full.
-static PendingAck *ackAlloc(const String &kind, const String &uploadId = "")
-{
-  String k = ackMakeKey(kind, uploadId);
-  uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
-
-  // Linear probe
-  for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+  for (int i = 0; i < ACK_MAP_SIZE; i++)
   {
-    PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
+    PendingAck &slot = ackMap[i];
 
-    // Duplicate guard: same key already waiting
-    if (slot.active && !slot.resolved && slot.key == k)
+    // Duplicate guard: already waiting on this exact payload
+    if (slot.active && !slot.resolved && slot.kind == kind && slot.uploadId == uploadId)
+    {
       return nullptr;
+    }
 
     // Free or already-resolved slot -- claim it
     if (!slot.active || slot.resolved)
@@ -76,33 +85,27 @@ static PendingAck *ackAlloc(const String &kind, const String &uploadId = "")
       slot.active = true;
       slot.resolved = false;
       slot.accepted = false;
-      slot.key = k;
+      slot.kind = kind;
+      slot.uploadId = uploadId;
       return &slot;
     }
   }
 
-  // Map full -- evict the home slot and warn
-
-  PendingAck &evict = ackMap[idx];
-  evict.active = true;
-  evict.resolved = false;
-  evict.accepted = false;
-  evict.key = k;
-  return &evict;
+  // Map is strictly full. Returning nullptr safely aborts the send instead
+  // of maliciously evicting a pending ACK that another thread/loop is waiting on.
+  return nullptr;
 }
 
-// O(1) avg: hash directly to the home bucket, then probe for the key.
-static void ackDispatch(const char *kind, const char *uploadId, bool accepted)
+static void ackDispatch(const char *kindStr, const char *uploadId, bool accepted)
 {
-  String k = ackMakeKey(kind, uploadId);
-  uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
+  AckKind kind = getAckKind(kindStr);
+  if (kind == ACK_NONE)
+    return;
 
-  for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+  for (int i = 0; i < ACK_MAP_SIZE; i++)
   {
-    PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
-    if (!slot.active)
-      break; // empty slot -- key not present
-    if (!slot.resolved && slot.key == k)
+    PendingAck &slot = ackMap[i];
+    if (slot.active && !slot.resolved && slot.kind == kind && slot.uploadId == uploadId)
     {
       slot.accepted = accepted;
       slot.resolved = true;
@@ -111,23 +114,16 @@ static void ackDispatch(const char *kind, const char *uploadId, bool accepted)
   }
 }
 
-// O(1) avg: checks only whether an image.start or image.complete ACK for the
-// given uploadId is still active. Unrelated ACKs (e.g. temperature) do not block
-// new livestream frames.
 static bool ackImageActive(const String &uploadId)
 {
-  const char *imageKinds[] = {"image.start", "image.complete"};
-  for (const char *kind : imageKinds)
+  for (int i = 0; i < ACK_MAP_SIZE; i++)
   {
-    String k = ackMakeKey(kind, uploadId);
-    uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
-    for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+    PendingAck &slot = ackMap[i];
+    if (slot.active && !slot.resolved &&
+        (slot.kind == ACK_IMAGE_START || slot.kind == ACK_IMAGE_COMPLETE) &&
+        slot.uploadId == uploadId)
     {
-      PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
-      if (!slot.active)
-        break;
-      if (!slot.resolved && slot.key == k)
-        return true;
+      return true;
     }
   }
   return false;
@@ -170,7 +166,8 @@ static bool sendPayload(JsonDocument &doc, bool initial = false)
 static bool waitAck(PendingAck *slot)
 {
   if (!slot)
-    return false; // duplicate was suppressed; treat as rejected
+    return false; // duplicate was suppressed or map full; treat as rejected
+
   unsigned long t0 = millis();
   while (!slot->resolved)
   {
@@ -191,8 +188,9 @@ static bool waitAck(PendingAck *slot)
     esp_task_wdt_reset();
     taskYIELD();
   }
+
   bool accepted = slot->accepted;
-  slot->active = false;
+  slot->active = false; // Important: explicitly free the slot once resolved
   return accepted;
 }
 
@@ -266,7 +264,7 @@ static void sendChunkedImage(bool isRequested = false)
   imageInFlightUploadId = uploadId;
   size_t totalBytes = fb->len;
 
-  PendingAck *ackStart = ackAlloc("image.start", uploadId);
+  PendingAck *ackStart = ackAlloc(ACK_IMAGE_START, uploadId);
   PendingAck *ackComplete = nullptr;
 
   // ---- 1. image.start ----------------------------------------------------
@@ -297,20 +295,38 @@ static void sendChunkedImage(bool isRequested = false)
     int sendFailCount = 0;
     while (offset < totalBytes)
     {
+      esp_task_wdt_reset();
       size_t chunkLen = min((size_t)IMAGE_CHUNK_SIZE, totalBytes - offset);
 
       if (webSocket.sendBIN(fb->buf + offset, chunkLen))
       {
         offset += chunkLen;
         sendFailCount = 0;
+        esp_task_wdt_reset();
       }
-      esp_task_wdt_reset(); 
-      webSocket.loop();
+      else
+      {
+        sendFailCount++;
+
+        if (sendFailCount > 5)
+        {
+          break;
+        }
+        esp_task_wdt_reset();
+        yield();
+        webSocket.loop();
+      }
+    }
+
+    // If we aborted due to network backpressure, cancel the rest of the process
+    if (sendFailCount > 0)
+    {
+      goto cleanup;
     }
   }
 
   // ---- 3. image.complete -------------------------------------------------
-  ackComplete = ackAlloc("image.complete", uploadId);
+  ackComplete = ackAlloc(ACK_IMAGE_COMPLETE, uploadId);
   {
     JsonDocument doc;
     doc["kind"] = "image.complete";
