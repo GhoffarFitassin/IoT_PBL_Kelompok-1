@@ -178,7 +178,6 @@ static bool waitAck(PendingAck *slot)
       return false;
     }
     webSocket.loop();
-    yield();
     if (millis() - t0 > ACK_TIMEOUT_MS)
     {
       slot->active = false;
@@ -186,7 +185,7 @@ static bool waitAck(PendingAck *slot)
     }
     // Feed the watchdog so a long wait doesn't cause a random reset
     esp_task_wdt_reset();
-    taskYIELD();
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
   bool accepted = slot->accepted;
@@ -370,7 +369,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     break;
 
   case WStype_DISCONNECTED:
-    ESP.restart();
+    wsConnected = false;
+    // ESP.restart();
     break;
 
   // ---- text frame --------------------------------------------------------
@@ -521,7 +521,7 @@ static void startWebSocket()
 #else
   webSocket.begin(WS_HOST, atoi(ENV_WS_PORT), WS_PATH);
 #endif
-  webSocket.enableHeartbeat(15000, 5000, 7);
+  webSocket.enableHeartbeat(15000, 3000, 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +606,10 @@ void loop()
     pendingAbilityNoOutput = false;
   }
   if (!wsConnected || !handshakeDone || deviceMode == MODE_IDLE)
+  {
+    vTaskDelay(pdMS_TO_TICKS(1));
     return;
+  }
 
   unsigned long now = millis();
 

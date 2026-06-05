@@ -125,8 +125,7 @@ bool readTemperatureAndHumidity(float &temp, float &hum)
       return false;
     }
     esp_task_wdt_reset();
-    taskYIELD();
-    yield();
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
   if (!data.ok)

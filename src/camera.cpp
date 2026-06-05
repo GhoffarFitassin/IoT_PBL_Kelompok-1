@@ -103,13 +103,12 @@ static camera_fb_t *captureWithTimeout(bool forceFresh, unsigned long timeoutMs)
   {
     if (millis() - t0 >= timeoutMs)
     {
-      vTaskDelete(taskHandle);
-      // s_captureData is static — safe to leave; will be reset on next call
+      ESP.restart();      
+      
       return nullptr;
     }
     esp_task_wdt_reset();
-    taskYIELD();
-    yield();
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
   return s_captureData.fb;
