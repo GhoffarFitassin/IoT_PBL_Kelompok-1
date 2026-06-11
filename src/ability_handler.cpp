@@ -44,7 +44,7 @@ bool handleAbilityRequest(const String &method, const String &ability,
   response["kind"] = "ability.response";
   response["uuid"] = DEVICE_UUID;
   response["method"] = method;
-  response["ability"] = ability;
+  response["ability"] = ability;  // correct for GET; overridden later for SET
   response["requestId"] = requestId;
 
   auto reject = [&](const char *error)
@@ -65,8 +65,6 @@ bool handleAbilityRequest(const String &method, const String &ability,
   // Merge ability value with external value (external takes priority if not OFF)
   if (classLightState != CLASS_LED_OFF)
     abilityState = classLightState;
-  
-  response["ability"] = normalizedAbility;
 
   // ---- SET abilities -----------------------------------------------------
   if (method == "set")
@@ -78,6 +76,7 @@ bool handleAbilityRequest(const String &method, const String &ability,
     }
 
     setClassUsageLed(abilityState);
+    response["ability"] = "class_light"; // normalize ability name for SET
     response["accepted"] = true;
     
     // Return the LED status as string

@@ -24,86 +24,88 @@ String previewRoomId = "";
 bool liveStreamEnabled = false;
 int tempIntervalSec = TEMP_INTERVAL_DEFAULT;
 int countIntervalSec = COUNT_INTERVAL_DEFAULT;
-bool classInUse = false;
 
 unsigned long lastTempMs = 0;
 unsigned long lastImageMs = 0;
 bool imageInFlight = false;
 String imageInFlightUploadId = "";
-#define ACK_MAP_SIZE 8  // must be power-of-two; keep load < 0.75
+
+// ---------------------------------------------------------------------------
+// Acknowledgment (ACK) Management - Optimized Linear Map
+// ---------------------------------------------------------------------------
+#define ACK_MAP_SIZE 8
+
+enum AckKind
+{
+  ACK_NONE,
+  ACK_IMAGE_START,
+  ACK_IMAGE_COMPLETE
+};
 
 struct PendingAck
 {
-  bool active   = false;
+  bool active = false;
   bool resolved = false;
   bool accepted = false;
-  String key    = "";  // "kind:uploadId"
+  AckKind kind = ACK_NONE;
+  String uploadId = "";
 };
+
 static PendingAck ackMap[ACK_MAP_SIZE];
 
-static uint32_t ackHash(const String &k)
+// Helper to avoid heavy string comparisons where possible
+static AckKind getAckKind(const char *kindStr)
 {
-  // FNV-1a 32-bit
-  uint32_t h = 2166136261UL;
-  for (size_t i = 0; i < k.length(); i++)
-    h = (h ^ (uint8_t)k[i]) * 16777619UL;
-  return h;
+  if (strcmp(kindStr, "image.start") == 0)
+    return ACK_IMAGE_START;
+  if (strcmp(kindStr, "image.complete") == 0)
+    return ACK_IMAGE_COMPLETE;
+  return ACK_NONE;
 }
 
-static String ackMakeKey(const String &kind, const String &uploadId)
+// O(N) linear scan (N=8). Faster and avoids heap fragmentation from String concat.
+static PendingAck *ackAlloc(AckKind kind, const String &uploadId = "")
 {
-  return kind + ":" + uploadId;
-}
+  if (kind == ACK_NONE)
+    return nullptr;
 
-// Returns pointer to a new slot, or nullptr if key is already active (duplicate).
-// Prints a warning and evicts the oldest colliding slot if the map is full.
-static PendingAck *ackAlloc(const String &kind, const String &uploadId = "")
-{
-  String k = ackMakeKey(kind, uploadId);
-  uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
-
-  // Linear probe
-  for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+  for (int i = 0; i < ACK_MAP_SIZE; i++)
   {
-    PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
+    PendingAck &slot = ackMap[i];
 
-    // Duplicate guard: same key already waiting
-    if (slot.active && !slot.resolved && slot.key == k)
+    // Duplicate guard: already waiting on this exact payload
+    if (slot.active && !slot.resolved && slot.kind == kind && slot.uploadId == uploadId)
+    {
       return nullptr;
+    }
 
     // Free or already-resolved slot -- claim it
     if (!slot.active || slot.resolved)
     {
-      slot.active   = true;
+      slot.active = true;
       slot.resolved = false;
       slot.accepted = false;
-      slot.key      = k;
+      slot.kind = kind;
+      slot.uploadId = uploadId;
       return &slot;
     }
   }
 
-  // Map full -- evict the home slot and warn
-
-  PendingAck &evict = ackMap[idx];
-  evict.active   = true;
-  evict.resolved = false;
-  evict.accepted = false;
-  evict.key      = k;
-  return &evict;
+  // Map is strictly full. Returning nullptr safely aborts the send instead
+  // of maliciously evicting a pending ACK that another thread/loop is waiting on.
+  return nullptr;
 }
 
-// O(1) avg: hash directly to the home bucket, then probe for the key.
-static void ackDispatch(const char *kind, const char *uploadId, bool accepted)
+static void ackDispatch(const char *kindStr, const char *uploadId, bool accepted)
 {
-  String k = ackMakeKey(kind, uploadId);
-  uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
+  AckKind kind = getAckKind(kindStr);
+  if (kind == ACK_NONE)
+    return;
 
-  for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+  for (int i = 0; i < ACK_MAP_SIZE; i++)
   {
-    PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
-    if (!slot.active)
-      break;  // empty slot -- key not present
-    if (!slot.resolved && slot.key == k)
+    PendingAck &slot = ackMap[i];
+    if (slot.active && !slot.resolved && slot.kind == kind && slot.uploadId == uploadId)
     {
       slot.accepted = accepted;
       slot.resolved = true;
@@ -112,23 +114,16 @@ static void ackDispatch(const char *kind, const char *uploadId, bool accepted)
   }
 }
 
-// O(1) avg: checks only whether an image.start or image.complete ACK for the
-// given uploadId is still active. Unrelated ACKs (e.g. temperature) do not block
-// new livestream frames.
 static bool ackImageActive(const String &uploadId)
 {
-  const char *imageKinds[] = { "image.start", "image.complete" };
-  for (const char *kind : imageKinds)
+  for (int i = 0; i < ACK_MAP_SIZE; i++)
   {
-    String k = ackMakeKey(kind, uploadId);
-    uint32_t idx = ackHash(k) & (ACK_MAP_SIZE - 1);
-    for (int probe = 0; probe < ACK_MAP_SIZE; probe++)
+    PendingAck &slot = ackMap[i];
+    if (slot.active && !slot.resolved &&
+        (slot.kind == ACK_IMAGE_START || slot.kind == ACK_IMAGE_COMPLETE) &&
+        slot.uploadId == uploadId)
     {
-      PendingAck &slot = ackMap[(idx + probe) & (ACK_MAP_SIZE - 1)];
-      if (!slot.active)
-        break;
-      if (!slot.resolved && slot.key == k)
-        return true;
+      return true;
     }
   }
   return false;
@@ -145,7 +140,7 @@ static String pendingAbilityMethod;
 static String pendingAbilityName;
 static String pendingAbilityRequestId;
 static ClassLedState pendingAbilityClassLightState = CLASS_LED_OFF;
-
+static bool pendingAbilityNoOutput = false;
 
 // ---------------------------------------------------------------------------
 // Send helpers
@@ -171,24 +166,30 @@ static bool sendPayload(JsonDocument &doc, bool initial = false)
 static bool waitAck(PendingAck *slot)
 {
   if (!slot)
-    return false;  // duplicate was suppressed; treat as rejected
+    return false; // duplicate was suppressed or map full; treat as rejected
+
   unsigned long t0 = millis();
   while (!slot->resolved)
   {
-    webSocket.loop();
-    esp_task_wdt_reset();
-    yield();
-    if (millis() - t0 > ACK_TIMEOUT_MS)
+    // Early exit if WebSocket disconnected while waiting
+    if (!wsConnected)
     {
-
       slot->active = false;
       return false;
     }
-
-    taskYIELD();
+    webSocket.loop();
+    if (millis() - t0 > ACK_TIMEOUT_MS)
+    {
+      slot->active = false;
+      return false;
+    }
+    // Feed the watchdog so a long wait doesn't cause a random reset
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
+
   bool accepted = slot->accepted;
-  slot->active = false;
+  slot->active = false; // Important: explicitly free the slot once resolved
   return accepted;
 }
 
@@ -201,7 +202,6 @@ static void sendHandshake()
   doc["kind"] = "handshake";
   doc["uuid"] = DEVICE_UUID;
   sendPayload(doc, /*initial=*/true);
-
 }
 
 // ---------------------------------------------------------------------------
@@ -210,16 +210,8 @@ static void sendHandshake()
 static void sendAbilityDeclaration()
 {
   JsonDocument doc;
-  doc["kind"] = "ability";
-  doc["uuid"] = DEVICE_UUID;
-  JsonObject get = doc["abilities"]["get"].to<JsonObject>();
-  get["temp"] = "Read latest temperature and humidity";
-  get["picture"] = "Capture single JPEG frame and return metadata";
-  get["picture_bytes"] = "Capture JPEG frame and return base64 bytes";
-  JsonObject set = doc["abilities"]["set"].to<JsonObject>();
-  set["class_light"] = "Set classroom usage RGB LED status";
+  generateAbilityDeclaration(doc);
   sendPayload(doc);
-
 }
 
 // ---------------------------------------------------------------------------
@@ -227,10 +219,14 @@ static void sendAbilityDeclaration()
 // ---------------------------------------------------------------------------
 static void sendTemperature()
 {
-  float t = readTemperature();
-  float h = readHumidity();
-  if (t < 0 || h < 0)
+  float t, h;
+
+  // Combined read: ONE sensor cycle, WDT safety, failure backoff built in
+  esp_task_wdt_reset();
+  if (!readTemperatureAndHumidity(t, h))
     return;
+  esp_task_wdt_reset();
+
   setTemperatureLed(t);
 
   JsonDocument doc;
@@ -252,25 +248,22 @@ static void sendChunkedImage(bool isRequested = false)
 {
   if (imageInFlight && !isRequested)
   {
-
     return;
   }
 
-  camera_fb_t *fb = esp_camera_fb_get();
+  // Check if camera is temporarily disabled due to repeated failures
+  unsigned long now = millis();
+
+  camera_fb_t *fb = cameraCaptureFrame(isRequested);
   if (!fb)
-  {
-
     return;
-  }
 
   imageInFlight = true;
   String uploadId = makeUploadId();
   imageInFlightUploadId = uploadId;
   size_t totalBytes = fb->len;
 
-
-
-  PendingAck *ackStart = ackAlloc("image.start", uploadId);
+  PendingAck *ackStart = ackAlloc(ACK_IMAGE_START, uploadId);
   PendingAck *ackComplete = nullptr;
 
   // ---- 1. image.start ----------------------------------------------------
@@ -282,8 +275,10 @@ static void sendChunkedImage(bool isRequested = false)
     doc["mimeType"] = "image/jpeg";
     doc["totalBytes"] = (int)totalBytes;
     doc["chunkSize"] = IMAGE_CHUNK_SIZE;
-    if (!sendPayload(doc)) {
-      if (ackStart) ackStart->active = false;
+    if (!sendPayload(doc))
+    {
+      if (ackStart)
+        ackStart->active = false;
       goto cleanup;
     }
   }
@@ -296,24 +291,41 @@ static void sendChunkedImage(bool isRequested = false)
   // ---- 2. Binary chunks --------------------------------------------------
   {
     size_t offset = 0;
+    int sendFailCount = 0;
     while (offset < totalBytes)
     {
-      size_t chunkLen = min((size_t)IMAGE_CHUNK_SIZE, totalBytes - offset);
-      
-      if (webSocket.sendBIN(fb->buf + offset, chunkLen)) {
-        offset += chunkLen;
-      } else {
-        delay(5);
-      }
-
-      webSocket.loop();
       esp_task_wdt_reset();
-      yield();
+      size_t chunkLen = min((size_t)IMAGE_CHUNK_SIZE, totalBytes - offset);
+
+      if (webSocket.sendBIN(fb->buf + offset, chunkLen))
+      {
+        offset += chunkLen;
+        sendFailCount = 0;
+        esp_task_wdt_reset();
+      }
+      else
+      {
+        sendFailCount++;
+
+        if (sendFailCount > 5)
+        {
+          break;
+        }
+        esp_task_wdt_reset();
+        yield();
+        webSocket.loop();
+      }
+    }
+
+    // If we aborted due to network backpressure, cancel the rest of the process
+    if (sendFailCount > 0)
+    {
+      goto cleanup;
     }
   }
 
   // ---- 3. image.complete -------------------------------------------------
-  ackComplete = ackAlloc("image.complete", uploadId);
+  ackComplete = ackAlloc(ACK_IMAGE_COMPLETE, uploadId);
   {
     JsonDocument doc;
     doc["kind"] = "image.complete";
@@ -326,9 +338,11 @@ static void sendChunkedImage(bool isRequested = false)
       doc["liveStream"] = true;
     if (isRequested)
       doc["isRequested"] = true;
-      
-    if (!sendPayload(doc)) {
-      if (ackComplete) ackComplete->active = false;
+
+    if (!sendPayload(doc))
+    {
+      if (ackComplete)
+        ackComplete->active = false;
       goto cleanup;
     }
   }
@@ -336,11 +350,10 @@ static void sendChunkedImage(bool isRequested = false)
   waitAck(ackComplete);
 
 cleanup:
-  esp_camera_fb_return(fb);
+  cameraReleaseFrame(fb);
   imageInFlight = false;
   imageInFlightUploadId = "";
 }
-
 
 // ---------------------------------------------------------------------------
 // WebSocket event callback
@@ -353,33 +366,21 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     wsConnected = true;
     handshakeDone = false;
     pendingSendHandshake = true;
-
     break;
 
   case WStype_DISCONNECTED:
     wsConnected = false;
-    handshakeDone = false;
-    for (int i = 0; i < ACK_MAP_SIZE; i++)
-    {
-      if (ackMap[i].active)
-      {
-        ackMap[i].accepted = false;
-        ackMap[i].resolved = true;
-      }
-    }
-
+    // ESP.restart();
     break;
 
   // ---- text frame --------------------------------------------------------
   case WStype_TEXT:
   {
 
-
     JsonDocument data;
     DeserializationError derr = deserializeJson(data, payload, length);
     if (derr != DeserializationError::Ok)
     {
-
       break;
     }
 
@@ -387,12 +388,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
     if (strcmp(msgType, "ready") == 0)
     {
-
       break;
     }
     if (strcmp(msgType, "error") == 0)
     {
-
       break;
     }
     if (strcmp(msgType, "data") != 0)
@@ -412,11 +411,9 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     }
     else
     {
-
       break;
     }
     const char *kind = msg["kind"] | "";
-
 
     // ---- Resolve pending ACK (image.start / image.complete only) ------
     if (strcmp(kind, "image.start") == 0 || strcmp(kind, "image.complete") == 0)
@@ -424,7 +421,7 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       const char *uploadId = msg["uploadId"] | "";
       bool accepted = msg["accepted"] | false;
       ackDispatch(kind, uploadId, accepted);
-      break;  // ACK messages need no further dispatch
+      break; // ACK messages need no further dispatch
     }
 
     if (!(msg["accepted"] | false) && strcmp(kind, "ability.request") != 0)
@@ -455,12 +452,10 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
       deviceMode = parseMode(msg["mode"] | "", deviceMode);
       tempIntervalSec = max(1, (int)(msg["tempFetchInterval"] | tempIntervalSec));
       countIntervalSec = max(1, (int)(msg["countFetchInterval"] | countIntervalSec));
-
     }
     else if (strcmp(kind, "capture.request") == 0)
     {
       pendingSendCapture = true;
-
     }
     else if (strcmp(kind, "ability.request") == 0)
     {
@@ -470,19 +465,21 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
         pendingAbilityMethod = msg["command"] | "";
       normalizeAbilityCommand(pendingAbilityMethod, pendingAbilityName);
       pendingAbilityRequestId = msg["requestId"] | "";
-      
+
+      // Parse --no-output flag
+      pendingAbilityNoOutput = (pendingAbilityName.indexOf("--no-output") >= 0);
+      if (pendingAbilityNoOutput)
+      {
+        pendingAbilityName.replace("--no-output", "");
+        pendingAbilityName.trim();
+      }
+
       // Parse class light state from the message
       const char *valueStr = msg["value"] | "";
       if (valueStr && valueStr[0] != '\0')
         pendingAbilityClassLightState = parseClassLightValue(String(valueStr));
       else
         pendingAbilityClassLightState = CLASS_LED_OFF;
-      
-
-    }
-    else
-    {
-
     }
     break;
   }
@@ -498,16 +495,33 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 // ---------------------------------------------------------------------------
 // WiFi connect helper
 // ---------------------------------------------------------------------------
-static void connectWifi()
+static bool connectWifi()
 {
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
-
+    esp_task_wdt_reset(); // Feed watchdog during WiFi connection wait
+    if (millis() - t0 >= (unsigned long)WIFI_CONNECT_TIMEOUT_MS)
+    {
+      return false;
+    }
   }
+  return true;
+}
 
+// ---------------------------------------------------------------------------
+// WebSocket connect helper
+// ---------------------------------------------------------------------------
+static void startWebSocket()
+{
+#if WS_SSL_ENABLED
+  webSocket.beginSSL(WS_HOST, atoi(ENV_WS_PORT), WS_PATH);
+#else
+  webSocket.begin(WS_HOST, atoi(ENV_WS_PORT), WS_PATH);
+#endif
+  webSocket.enableHeartbeat(15000, 3000, 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -515,56 +529,43 @@ static void connectWifi()
 // ---------------------------------------------------------------------------
 void setup()
 {
-  Serial.end();
-  
+  // Serial.end(); // Commented out - can interfere with debugging
+
   // Initialize hardware modules
   ledInit();
   temperatureInit();
 
-  if (!hasConfigValue(WIFI_SSID) || !hasConfigValue(WIFI_PASSWORD) ||
-      !hasConfigValue(WS_HOST) || !hasConfigValue(DEVICE_UUID))
-  {
-
-    while (true)
-      delay(1000);
-  }
+  // ---- Configure Watchdog Timer (x second timeout) ----------------------
+  esp_task_wdt_init(7, true); // x sec timeout, panic on timeout
+  esp_task_wdt_add(NULL);     // Add current thread to WDT watch
 
   connectWifi();
 
   if (!cameraInit())
   {
-
-    while (true)
-      delay(1000);
+    ESP.restart();
   }
 
   // ---- Configure links2004/WebSockets ------------------------------------
-#if WS_SSL_ENABLED
-  webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-#else
-  webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
-#endif
+  startWebSocket();
   webSocket.onEvent(webSocketEvent);
 
   String hdrs = "X-Auth-Method: deviceUuid\r\nX-Device-UUID: ";
   hdrs += DEVICE_UUID;
   webSocket.setExtraHeaders(hdrs.c_str());
 
-  webSocket.setReconnectInterval(RECONNECT_DELAY_MS);
+  esp_task_wdt_reset();
 }
 
 void loop()
 {
+  // Feed watchdog at start of every loop iteration
+  esp_task_wdt_reset();
+
   if (WiFi.status() != WL_CONNECTED)
   {
     wsConnected = false;
     connectWifi();
-
-#if WS_SSL_ENABLED
-    webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
-#else
-    webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
-#endif
   }
 
   webSocket.loop();
@@ -595,15 +596,20 @@ void loop()
     pendingAbilityName = "";
     pendingAbilityRequestId = "";
     pendingAbilityClassLightState = CLASS_LED_OFF;
-    
+
     JsonDocument resp;
     if (handleAbilityRequest(m, a, r, state, resp))
     {
-      sendPayload(resp);
+      if (!pendingAbilityNoOutput)
+        sendPayload(resp);
     }
+    pendingAbilityNoOutput = false;
   }
   if (!wsConnected || !handshakeDone || deviceMode == MODE_IDLE)
+  {
+    vTaskDelay(pdMS_TO_TICKS(1));
     return;
+  }
 
   unsigned long now = millis();
 
@@ -627,7 +633,10 @@ void loop()
       sendChunkedImage();
     }
 #else
-    if (!ackImageActive(imageInFlightUploadId)) { sendChunkedImage(); }
+    if (!ackImageActive(imageInFlightUploadId))
+    {
+      sendChunkedImage();
+    }
 #endif
   }
   else if (now - lastImageMs >= (unsigned long)countIntervalSec * 1000UL)
@@ -635,4 +644,7 @@ void loop()
     lastImageMs = now;
     sendChunkedImage();
   }
+
+  esp_task_wdt_reset();
+  vTaskDelay(pdMS_TO_TICKS(1));
 }

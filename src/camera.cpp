@@ -1,8 +1,8 @@
 #include "camera.h"
+#include "esp_task_wdt.h"
 
 // ---------------------------------------------------------------------------
 // Camera Pin Configuration -- AI-Thinker ESP32-CAM
-// Replace the entire block below for a different board.
 // ---------------------------------------------------------------------------
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
@@ -24,13 +24,99 @@
 // ---------------------------------------------------------------------------
 // Image / PSRAM Settings
 // ---------------------------------------------------------------------------
-#define JPEG_QUALITY 12
+#define JPEG_QUALITY 2
 #define FRAME_SIZE FRAMESIZE_SVGA
 
 // ---------------------------------------------------------------------------
-// Public Functions
+// Timeout & Failure Constants
 // ---------------------------------------------------------------------------
+#define CAPTURE_TASK_TIMEOUT_MS 1000
+#define CAPTURE_TASK_STACK (3 * 1024)
 
+// ---------------------------------------------------------------------------
+// CaptureTaskData — STATIC allocation so the capture task can never write
+// to a freed stack frame if the caller times out and returns early.
+// Only one capture runs at a time so a single static instance is safe.
+// ---------------------------------------------------------------------------
+typedef struct
+{
+  camera_fb_t *fb;
+  volatile bool done;
+  bool forceFresh;
+} CaptureTaskData;
+
+static CaptureTaskData s_captureData;
+
+// ---------------------------------------------------------------------------
+// FreeRTOS capture task — pinned to core 0, isolated from ws_task & loop()
+// ---------------------------------------------------------------------------
+static void captureTaskFunc(void *pvParams)
+{
+  CaptureTaskData *d = (CaptureTaskData *)pvParams;
+
+  if (d->forceFresh)
+  {
+    camera_fb_t *discard = esp_camera_fb_get();
+    if (discard)
+    {
+      esp_camera_fb_return(discard);
+      vTaskDelay(pdMS_TO_TICKS(25));
+    }
+  }
+
+  d->fb = esp_camera_fb_get();
+  d->done = true; // visible to caller: write after fb so compiler can't reorder
+  vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// captureWithTimeout
+//
+// Spawns captureTaskFunc on core 0 and waits up to timeoutMs.
+// Uses the static s_captureData to avoid dangling-pointer UB when the caller
+// times out before the task writes its result.
+// If the task times out it is killed — the camera DMA will eventually finish
+// and write to s_captureData.fb, but done=true is never set so the next call
+// to captureWithTimeout reinitialises s_captureData before spawning again,
+// meaning the stale write is harmless.
+// ---------------------------------------------------------------------------
+static camera_fb_t *captureWithTimeout(bool forceFresh, unsigned long timeoutMs)
+{
+  s_captureData.fb = nullptr;
+  s_captureData.done = false;
+  s_captureData.forceFresh = forceFresh;
+
+  TaskHandle_t taskHandle = NULL;
+  xTaskCreatePinnedToCore(
+      captureTaskFunc,
+      "cam_cap",
+      CAPTURE_TASK_STACK,
+      &s_captureData,
+      3, // moderate priority; below ws_task (5), above loop() (1)
+      &taskHandle,
+      0 // core 0 — isolated from WebSocket and Arduino loop
+  );
+
+  // Wait for task completion or timeout
+  unsigned long t0 = millis();
+  while (!s_captureData.done)
+  {
+    if (millis() - t0 >= timeoutMs)
+    {
+      ESP.restart();      
+      
+      return nullptr;
+    }
+    esp_task_wdt_reset();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  return s_captureData.fb;
+}
+
+// ---------------------------------------------------------------------------
+// cameraInit
+// ---------------------------------------------------------------------------
 bool cameraInit()
 {
   camera_config_t cfg = {};
@@ -60,56 +146,62 @@ bool cameraInit()
     cfg.frame_size = FRAME_SIZE;
     cfg.jpeg_quality = JPEG_QUALITY;
     cfg.fb_count = 2;
+    cfg.fb_location = CAMERA_FB_IN_PSRAM;
   }
   else
   {
     cfg.frame_size = FRAMESIZE_QVGA;
     cfg.jpeg_quality = 12;
     cfg.fb_count = 1;
+    cfg.fb_location = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK)
     return false;
+
   return true;
 }
 
-camera_fb_t* cameraCaptureFrame()
+camera_fb_t *cameraCaptureFrame(bool forceFresh)
 {
-  return esp_camera_fb_get();
+
+  camera_fb_t *fb = captureWithTimeout(forceFresh, CAPTURE_TASK_TIMEOUT_MS);
+  return fb;
 }
 
-void cameraReleaseFrame(camera_fb_t* fb)
+// ---------------------------------------------------------------------------
+// cameraReleaseFrame
+// ---------------------------------------------------------------------------
+void cameraReleaseFrame(camera_fb_t *fb)
 {
   if (fb)
-  {
     esp_camera_fb_return(fb);
-  }
 }
 
-char* cameraEncodeBase64(camera_fb_t* fb, size_t* outLen)
+// ---------------------------------------------------------------------------
+// cameraEncodeBase64
+// ---------------------------------------------------------------------------
+char *cameraEncodeBase64(camera_fb_t *fb, size_t *outLen)
 {
   if (!fb)
     return nullptr;
 
-  // Base64 encoding characters
   static const char b64chars[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  
+
   size_t inLen = fb->len;
   size_t b64Len = ((inLen + 2) / 3) * 4 + 1;
   char *b64Buf = (char *)malloc(b64Len);
-  
   if (!b64Buf)
     return nullptr;
 
   uint8_t *in = fb->buf;
   char *out = b64Buf;
-  
   for (size_t i = 0; i < inLen; i += 3)
   {
-    uint32_t n = ((uint32_t)in[i] << 16) | 
-                 (i + 1 < inLen ? (uint32_t)in[i + 1] << 8 : 0) | 
+    uint32_t n = ((uint32_t)in[i] << 16) |
+                 (i + 1 < inLen ? (uint32_t)in[i + 1] << 8 : 0) |
                  (i + 2 < inLen ? (uint32_t)in[i + 2] : 0);
     *out++ = b64chars[(n >> 18) & 63];
     *out++ = b64chars[(n >> 12) & 63];
@@ -117,9 +209,7 @@ char* cameraEncodeBase64(camera_fb_t* fb, size_t* outLen)
     *out++ = (i + 2 < inLen) ? b64chars[n & 63] : '=';
   }
   *out = '\0';
-
   if (outLen)
     *outLen = b64Len;
-
   return b64Buf;
 }

@@ -54,8 +54,19 @@ extern const char *DEVICE_UUID;
 #define IMAGE_CHUNK_SIZE (8 * 1024)
 #define TEMP_INTERVAL_DEFAULT 60
 #define COUNT_INTERVAL_DEFAULT 60
-#define ACK_TIMEOUT_MS 30000
-#define RECONNECT_DELAY_MS 5000
+#define ACK_TIMEOUT_MS 1000
+
+// WebSocket reconnect (exponential backoff)
+#define RECONNECT_DELAY_MS 5000       // keep for backward compat, not used for auto-reconnect
+#define WS_RECONNECT_BASE_MS  1000    // initial backoff (1 s)
+#define WS_RECONNECT_MAX_MS   60000   // cap (60 s)
+#define WS_RECONNECT_MULTIPLIER 2     // exponential factor
+#define WS_RECONNECT_ATTEMPT_MAX 3   // halt after this many consecutive failures
+#define WS_RECONNECT_RESET_MS  300000 // reset counter after 5 min of stable connection
+
+// WiFi connection timeout
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+
 #define LIVESTREAM_FPS -1  // max frames per second during live stream; -1 = uncapped
 
 // ---------------------------------------------------------------------------

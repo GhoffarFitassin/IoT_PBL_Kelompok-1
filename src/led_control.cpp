@@ -56,7 +56,7 @@ void setTemperatureLed(float temperature)
     writeRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN, false, false, true);
     return;
   }
-  if (temperature <= 25.0f)
+  if (temperature <= 28.5f)
   {
     // Yellow for comfortable
     writeRgbLed(TEMP_LED_R_PIN, TEMP_LED_G_PIN, TEMP_LED_B_PIN, true, true, false);
